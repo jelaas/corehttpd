@@ -43,11 +43,14 @@ typedef struct DirCfg {
 
 typedef struct SiteCfg { const char *name; DirCfg *root; } SiteCfg;
 
+struct TlsKey;   /* from tls.c */
+
 typedef struct Config {
     const char *httpd_user;
     const char *cgi_user;                /* fallback user for CGI entries */
     const char *cert_file;
     const char *key_file;
+    struct TlsKey *tls_key;              /* loaded once by the master */
     const char *letsencrypt_root;
     size_t      arena_size;
     int         def_header_timeout, def_body_timeout, def_keepalive;
@@ -60,6 +63,8 @@ SiteCfg *config_find_site(Config *, const char *host);
 DirCfg *config_walk(DirCfg *root, char *path_scratch, char **rest);
 
 /* ---------- http ---------- */
+typedef struct TlsConn TlsConn;   /* from tls.c */
+
 typedef struct {
     char        *method;
     char        *path;
@@ -72,17 +77,36 @@ typedef struct {
     char        *body; size_t body_len;
 } HttpRequest;
 
-int  http_read_request(Arena *, int fd, HttpRequest *, int hdr_timeout,
+/* unified I/O endpoint: plain fd or a TLS connection */
+typedef struct Conn { int fd; TlsConn *tls; } Conn;
+
+int  http_read_request(Arena *, Conn *, HttpRequest *, int hdr_timeout,
                        int body_timeout);
-int  http_send_simple(int fd, int code, const char *reason,
+int  http_send_simple(Conn *, int code, const char *reason,
                       const char *extra_hdrs, const char *body,
                       size_t body_len, int head_only);
 
 /* ---------- tls ---------- */
 typedef struct TlsConn TlsConn;
-TlsConn *tls_server_handshake(Arena *, int fd, const char *cert, const char *key);
+
+#define TLS_MAX_CERTS 16
+
+/* TLS material loaded once by the master process and shared (via fork)
+ * with the httpd child; the child never reads the cert/key files. */
+typedef struct TlsKey {
+    unsigned char priv[32];              /* ECDSA P-256 private scalar */
+    int n_certs;
+    const unsigned char *der[TLS_MAX_CERTS];   /* certificate chain, DER */
+    size_t len[TLS_MAX_CERTS];
+} TlsKey;
+
+TlsKey *tls_load_key(Arena *, const char *cert_file, const char *key_file);
+
+TlsConn *tls_server_handshake(Arena *, int fd, const TlsKey *key, int timeout);
 ssize_t  tls_read (TlsConn *, void *, size_t);
 ssize_t  tls_write(TlsConn *, const void *, size_t);
+int      tls_pending(TlsConn *);
+void     tls_unread(TlsConn *, const void *, size_t);
 void     tls_close(TlsConn *);
 
 #endif

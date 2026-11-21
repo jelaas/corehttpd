@@ -344,13 +344,29 @@ DirCfg *config_walk(DirCfg *root, char *path, char **rest) {
 /* =====================================================================
  * tiny helpers
  * ===================================================================== */
-static int wait_readable(int fd, int secs) {
-    struct pollfd p = { fd, POLLIN, 0 };
+static int wait_readable(Conn *c, int secs) {
+    if (c->tls && tls_pending(c->tls)) return 1;
+    struct pollfd p = { c->fd, POLLIN, 0 };
     int r = poll(&p, 1, secs * 1000);
     return r > 0 && (p.revents & POLLIN);
 }
 
-static int send_all(int fd, const void *buf, size_t n) {
+static ssize_t conn_read(Conn *c, void *buf, size_t n) {
+    return c->tls ? tls_read(c->tls, buf, n) : read(c->fd, buf, n);
+}
+
+static int send_all(Conn *c, const void *buf, size_t n) {
+    const char *p = buf;
+    while (n) {
+        ssize_t w = c->tls ? tls_write(c->tls, p, n) : write(c->fd, p, n);
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        p += w; n -= (size_t)w;
+    }
+    return 0;
+}
+
+/* raw-fd variant for the cgi socketpair */
+static int send_fd_all(int fd, const void *buf, size_t n) {
     const char *p = buf;
     while (n) {
         ssize_t w = write(fd, p, n);
@@ -392,14 +408,14 @@ static int b64_decode(const char *in, unsigned char *out, size_t outmax) {
 /* =====================================================================
  * HTTP request parser
  * ===================================================================== */
-static char *read_headers(Arena *a, int fd, int timeout,
+static char *read_headers(Arena *a, Conn *c, int timeout,
                           size_t *out_len, size_t *out_extra) {
     size_t cap = 8192, len = 0, scanned = 0;
     char *buf = arena_alloc(a, cap);
     if (!buf) return NULL;
     while (len < cap) {
-        if (!wait_readable(fd, timeout)) return NULL;
-        ssize_t n = read(fd, buf + len, cap - len);
+        if (!wait_readable(c, timeout)) return NULL;
+        ssize_t n = conn_read(c, buf + len, cap - len);
         if (n <= 0) return NULL;
         len += (size_t)n;
         /* continue scanning where the previous scan stopped; -3 so a
@@ -428,11 +444,11 @@ static char *trim(char *s) {
     return s;
 }
 
-int http_read_request(Arena *a, int fd, HttpRequest *r,
+int http_read_request(Arena *a, Conn *c, HttpRequest *r,
                       int hdr_timeout, int body_timeout) {
     memset(r, 0, sizeof(*r));
     size_t hlen, extra;
-    char *raw = read_headers(a, fd, hdr_timeout, &hlen, &extra);
+    char *raw = read_headers(a, c, hdr_timeout, &hlen, &extra);
     if (!raw) return -1;
 
     char *nl = strstr(raw, "\r\n");
@@ -477,27 +493,34 @@ int http_read_request(Arena *a, int fd, HttpRequest *r,
         size_t got = 0;
         /* bytes read_headers() consumed beyond the header belong to the body */
         if (extra) {
-            if (extra > (size_t)r->content_length) return -1;
+            if (extra > (size_t)r->content_length) {
+                /* excess = pipelined next request; give it back */
+                if (!c->tls) return -1;
+                tls_unread(c->tls, raw + hlen + 4 + r->content_length,
+                           extra - (size_t)r->content_length);
+                extra = (size_t)r->content_length;
+            }
             memcpy(r->body, raw + hlen + 4, extra);
             got = extra;
         }
         while (got < (size_t)r->content_length) {
-            if (!wait_readable(fd, body_timeout)) return -1;
-            ssize_t n = read(fd, r->body + got, (size_t)r->content_length - got);
+            if (!wait_readable(c, body_timeout)) return -1;
+            ssize_t n = conn_read(c, r->body + got, (size_t)r->content_length - got);
             if (n <= 0) return -1;
             got += (size_t)n;
         }
         r->body[r->content_length] = 0;
         r->body_len = (size_t)r->content_length;
     } else if (extra) {
-        /* stray bytes past the header on a body-less request: reject
-         * (pipelined requests are not supported) */
-        return -1;
+        /* stray bytes past the header on a body-less request: pipelined
+         * request bytes; push them back (TLS only) or reject */
+        if (!c->tls) return -1;
+        tls_unread(c->tls, raw + hlen + 4, extra);
     }
     return 0;
 }
 
-int http_send_simple(int fd, int code, const char *reason,
+int http_send_simple(Conn *c, int code, const char *reason,
                      const char *extra, const char *body,
                      size_t body_len, int head_only) {
     char hdr[2048];
@@ -509,9 +532,9 @@ int http_send_simple(int fd, int code, const char *reason,
         "%s"
         "\r\n", code, reason, body_len, extra ? extra : "");
     if (n < 0 || (size_t)n >= sizeof(hdr)) return -1;
-    if (send_all(fd, hdr, (size_t)n) < 0) return -1;
+    if (send_all(c, hdr, (size_t)n) < 0) return -1;
     if (!head_only && body && body_len) {
-        if (send_all(fd, body, body_len) < 0) return -1;
+        if (send_all(c, body, body_len) < 0) return -1;
     }
     return 0;
 }
@@ -537,19 +560,19 @@ static int cgi_dispatch(Arena *a, int cgi_fd,
         .nenv     = (uint32_t)nenv,
         .body_len = (uint32_t)body_len,
     };
-    if (send_all(cgi_fd, &h, sizeof(h)) < 0) return -1;
-    if (send_all(cgi_fd, prog, h.prog_len) < 0) return -1;
-    if (send_all(cgi_fd, user, h.user_len) < 0) return -1;
+    if (send_fd_all(cgi_fd, &h, sizeof(h)) < 0) return -1;
+    if (send_fd_all(cgi_fd, prog, h.prog_len) < 0) return -1;
+    if (send_fd_all(cgi_fd, user, h.user_len) < 0) return -1;
     for (int i = 0; i < nenv; i++) {
         const char *e = env[i];
         const char *eq = strchr(e, '=');
         uint32_t kl = eq ? (uint32_t)(eq - e) : (uint32_t)strlen(e);
         uint32_t vl = eq ? (uint32_t)strlen(eq + 1) : 0;
-        send_all(cgi_fd, &kl, 4); send_all(cgi_fd, &vl, 4);
-        send_all(cgi_fd, e, kl);
-        if (vl) send_all(cgi_fd, eq + 1, vl);
+        send_fd_all(cgi_fd, &kl, 4); send_fd_all(cgi_fd, &vl, 4);
+        send_fd_all(cgi_fd, e, kl);
+        if (vl) send_fd_all(cgi_fd, eq + 1, vl);
     }
-    if (body_len) send_all(cgi_fd, body, body_len);
+    if (body_len) send_fd_all(cgi_fd, body, body_len);
     return 0;
 }
 
@@ -608,7 +631,7 @@ static int path_within_root(const char *root, const char *path) {
 }
 
 /* Serve a static file (index.html if dir). */
-static int serve_file(int fd, const char *root, const char *fullpath,
+static int serve_file(Conn *c, const char *root, const char *fullpath,
                       int head_only) {
     struct stat st;
     if (stat(fullpath, &st) < 0) return -1;
@@ -638,18 +661,18 @@ static int serve_file(int fd, const char *root, const char *fullpath,
         "Connection: keep-alive\r\n\r\n",
         ct, (long long)st.st_size);
     if (n < 0 || (size_t)n >= sizeof(hdr)) { close(f); return -1; }
-    if (send_all(fd, hdr, (size_t)n) < 0) { close(f); return -1; }
+    if (send_all(c, hdr, (size_t)n) < 0) { close(f); return -1; }
     if (!head_only) {
         char buf[65536]; ssize_t r;
         while ((r = read(f, buf, sizeof(buf))) > 0)
-            if (send_all(fd, buf, (size_t)r) < 0) break;
+            if (send_all(c, buf, (size_t)r) < 0) break;
     }
     close(f);
     return 0;
 }
 
 /* forward raw CGI output from cgi_fd to client */
-static int relay_cgi(int fd, int cgi_fd, int head_only) {
+static int relay_cgi(Conn *c, int cgi_fd, int head_only) {
     char buf[65536];
     int in_body = 0;
     size_t hdr_len = 0;
@@ -659,10 +682,10 @@ static int relay_cgi(int fd, int cgi_fd, int head_only) {
         if (r <= 0) break;
         if (head_only) {
             if (!in_body) {
-                size_t c = (size_t)r;
-                if (hdr_len + c >= sizeof(hdrbuf)) c = sizeof(hdrbuf) - hdr_len - 1;
-                memcpy(hdrbuf + hdr_len, buf, c);
-                hdr_len += c;
+                size_t csz = (size_t)r;
+                if (hdr_len + csz >= sizeof(hdrbuf)) csz = sizeof(hdrbuf) - hdr_len - 1;
+                memcpy(hdrbuf + hdr_len, buf, csz);
+                hdr_len += csz;
                 hdrbuf[hdr_len] = 0;
                 char *e = strstr(hdrbuf, "\r\n\r\n");
                 if (e) {
@@ -687,12 +710,12 @@ static int relay_cgi(int fd, int cgi_fd, int head_only) {
                         "HTTP/1.1 %s\r\nServer: corehttpd\r\n"
                         "Connection: keep-alive\r\n\r\n", status);
                     if (hn < 0 || (size_t)hn >= sizeof(h)) return -1;
-                    send_all(fd, h, (size_t)hn);
+                    send_all(c, h, (size_t)hn);
                     in_body = 1;
                 }
             }
         } else {
-            if (send_all(fd, buf, (size_t)r) < 0) break;
+            if (send_all(c, buf, (size_t)r) < 0) break;
         }
     }
     return 0;
@@ -743,23 +766,24 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
     struct sockaddr_in peer; socklen_t pl = sizeof(peer);
     getpeername(fd, (struct sockaddr *)&peer, &pl);
 
-    TlsConn *tls = NULL;
+    Conn conn = { fd, NULL };
     if (is_tls) {
-        tls = tls_server_handshake(ctx->arena, fd, ctx->cfg->cert_file, ctx->cfg->key_file);
-        if (!tls) { close(fd); return; }
+        conn.tls = tls_server_handshake(ctx->arena, fd, ctx->cfg->tls_key,
+                                        ctx->cfg->def_header_timeout);
+        if (!conn.tls) { close(fd); return; }
     }
 
     for (;;) {
         arena_reset(ctx->arena);
 
         HttpRequest req;
-        int r = http_read_request(ctx->arena, fd, &req,
+        int r = http_read_request(ctx->arena, &conn, &req,
                                   ctx->cfg->def_header_timeout,
                                   ctx->cfg->def_body_timeout);
         if (r < 0) break;
 
         SiteCfg *site = config_find_site(ctx->cfg, req.host);
-        if (!site) { http_send_simple(fd, 404, "Not Found", NULL, "no site", 7, 0); break; }
+        if (!site) { http_send_simple(&conn, 404, "Not Found", NULL, "no site", 7, 0); break; }
 
         /* mutate a scratch copy of the path for walking */
         char *path_scratch = arena_strdup(ctx->arena, req.path);
@@ -771,7 +795,7 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
         /* ---- port 80: redirect / letsencrypt / GET-HEAD only ---- */
         if (!is_tls) {
             if (strcmp(req.method, "GET") && strcmp(req.method, "HEAD")) {
-                http_send_simple(fd, 405, "Method Not Allowed",
+                http_send_simple(&conn, 405, "Method Not Allowed",
                                  "Allow: GET, HEAD\r\n", "no\r\n", 4, head_only);
                 if (!req.keep_alive) break;
 		continue;
@@ -782,13 +806,13 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
                                     ? ctx->cfg->letsencrypt_root
                                     : "/var/www/letsencrypt";
                 snprintf(full, sizeof(full), "%s/%s", le_root, req.path + 28);
-                if (serve_file(fd, le_root, full, head_only) < 0)
-                    http_send_simple(fd, 404, "Not Found", NULL, "not found\n", 10, head_only);
+                if (serve_file(&conn, le_root, full, head_only) < 0)
+                    http_send_simple(&conn, 404, "Not Found", NULL, "not found\n", 10, head_only);
             } else {
                 char loc[1024];
                 snprintf(loc, sizeof(loc), "Location: https://%s%s\r\n",
                          req.host ? req.host : site->name, req.path);
-                http_send_simple(fd, 301, "Moved Permanently", loc, "", 0, head_only);
+                http_send_simple(&conn, 301, "Moved Permanently", loc, "", 0, head_only);
             }
             if (!req.keep_alive) break;
             continue;
@@ -796,12 +820,12 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
 
         /* ---- restrictions ---- */
         if (!ip_allowed(eff, &peer)) {
-            http_send_simple(fd, 403, "Forbidden", NULL, "forbidden\n", 10, head_only);
+            http_send_simple(&conn, 403, "Forbidden", NULL, "forbidden\n", 10, head_only);
             if (!req.keep_alive) break;
 	    continue;
         }
         if (!auth_check(eff, req.authorization)) {
-            http_send_simple(fd, 401, "Unauthorized",
+            http_send_simple(&conn, 401, "Unauthorized",
                 "WWW-Authenticate: Basic realm=\"corehttpd\"\r\n",
                 "auth required\n", 14, head_only);
             if (!req.keep_alive) break;
@@ -873,9 +897,9 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
 
                 if (cgi_dispatch(ctx->arena, ctx->cgi_fd, prog_path, user,
                                  env, ne, req.body, req.body_len) < 0)
-                    http_send_simple(fd, 502, "Bad Gateway", NULL, "cgi\n", 4, head_only);
+                    http_send_simple(&conn, 502, "Bad Gateway", NULL, "cgi\n", 4, head_only);
                 else
-                    relay_cgi(fd, ctx->cgi_fd, head_only);
+                    relay_cgi(&conn, ctx->cgi_fd, head_only);
 
                 if (!req.keep_alive) break;
                 continue;
@@ -886,7 +910,7 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
         char full[2048];
         int fl = snprintf(full, sizeof(full), "%s/%s", eff->path, rest);
         if (fl < 0 || (size_t)fl >= sizeof(full)) {
-            http_send_simple(fd, 414, "URI Too Long", NULL, "uri too long\n", 13, head_only);
+            http_send_simple(&conn, 414, "URI Too Long", NULL, "uri too long\n", 13, head_only);
             if (!req.keep_alive) break;
             continue;
         }
@@ -895,27 +919,27 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
             size_t flen = strlen(full);
             static const char suffix[] = "/index.html";   /* 11 + NUL */
             if (flen + sizeof(suffix) > sizeof(full)) {
-                http_send_simple(fd, 414, "URI Too Long", NULL, "uri too long\n", 13, head_only);
+                http_send_simple(&conn, 414, "URI Too Long", NULL, "uri too long\n", 13, head_only);
                 if (!req.keep_alive) break;
                 continue;
             }
             memcpy(full + flen, suffix, sizeof(suffix));
-            if (serve_file(fd, eff->path, full, head_only) < 0)
-                http_send_simple(fd, 403, "Forbidden", NULL, "forbidden\n", 10, head_only);
+            if (serve_file(&conn, eff->path, full, head_only) < 0)
+                http_send_simple(&conn, 403, "Forbidden", NULL, "forbidden\n", 10, head_only);
         } else {
-            if (serve_file(fd, eff->path, full, head_only) < 0)
-                http_send_simple(fd, 404, "Not Found", NULL, "not found\n", 10, head_only);
+            if (serve_file(&conn, eff->path, full, head_only) < 0)
+                http_send_simple(&conn, 404, "Not Found", NULL, "not found\n", 10, head_only);
         }
         if (!req.keep_alive) break;
         continue;
 
 cgi_nomem:
-        http_send_simple(fd, 500, "Internal Server Error", NULL, "nomem\n", 6, head_only);
+        http_send_simple(&conn, 500, "Internal Server Error", NULL, "nomem\n", 6, head_only);
         if (!req.keep_alive) break;
         continue;
     }
 
-    if (tls) tls_close(tls);
+    if (conn.tls) tls_close(conn.tls);
     close(fd);
 }
 
@@ -1025,7 +1049,7 @@ static int cgi_run_one(int cgi_fd) {
         close(inp[1]);
         char buf[65536]; ssize_t r;
         while ((r = read(outp[0], buf, sizeof(buf))) > 0)
-            send_all(cgi_fd, buf, (size_t)r);
+            send_fd_all(cgi_fd, buf, (size_t)r);
         close(outp[0]);
         waitpid(p2, NULL, 0);
         _exit(0);
@@ -1072,10 +1096,28 @@ static void drop_to(const char *user) {
 int main(int argc, char **argv) {
     const char *cfgpath = argc > 1 ? argv[1] : "/etc/corehttpd/config.jsonc";
 
+    /* EPIPE instead of SIGPIPE death when a client goes away mid-write */
+    signal(SIGPIPE, SIG_IGN);
+
     Arena master_arena;
     arena_init(&master_arena, 4u << 20);
     Config *cfg = config_load(&master_arena, cfgpath);
     if (!cfg) { fprintf(stderr, "config load failed\n"); return 1; }
+
+    /* the master reads the TLS material once and passes it to the
+     * httpd child; the unprivileged child never touches the files */
+    if (cfg->cert_file || cfg->key_file) {
+        if (!cfg->cert_file || !cfg->key_file) {
+            fprintf(stderr, "config: need both cert_file and key_file\n");
+            return 1;
+        }
+        cfg->tls_key = tls_load_key(&master_arena,
+                                    cfg->cert_file, cfg->key_file);
+        if (!cfg->tls_key) {
+            fprintf(stderr, "config: failed to load TLS key\n");
+            return 1;
+        }
+    }
 
     int srv80  = open_port(80);
     int srv443 = open_port(443);
