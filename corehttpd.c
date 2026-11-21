@@ -86,10 +86,6 @@ static const char *j_str(json_t *o, const char *k) {
     json_t *v = o ? json_object_get(o, k) : NULL;
     return json_is_string(v) ? json_string_value(v) : NULL;
 }
-static int j_true(json_t *o, const char *k) {
-    json_t *v = o ? json_object_get(o, k) : NULL;
-    return json_is_true(v);
-}
 
 static Acl *parse_acl(Arena *a, json_t *arr, int *n_out) {
     *n_out = 0;
@@ -190,58 +186,18 @@ static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
     d->keepalive_timeout = j_int(j, "keepalive_timeout",
                                  parent ? parent->keepalive_timeout : cfg->def_keepalive);
 
-    /* ---- cgi: inherit from parent, then merge this dir ----
-     *
-     * Rules mirror auth:
-     *   - child starts with a copy of parent's effective list
-     *   - "cgi_clear": true wipes it first
-     *   - each entry in "cgi": [] overrides an existing name (found in the
-     *     inherited list) in place, or appends a new one
-     *   - an entry with "disabled": true removes it from the child's list
-     */
-    if (parent && parent->n_cgi) {
-        d->cgi = arena_alloc(a, sizeof(CgiProgram) * parent->n_cgi);
-        memcpy(d->cgi, parent->cgi, sizeof(CgiProgram) * parent->n_cgi);
-        d->n_cgi = parent->n_cgi;
-    }
-
-    if (j_true(j, "cgi_clear")) {
-        d->cgi = NULL;
-        d->n_cgi = 0;
-    }
-
+    /* ---- cgi: per-directory only, not inherited from the parent ---- */
     json_t *jcgi = json_object_get(j, "cgi");
     if (json_is_array(jcgi)) {
         size_t nadd = json_array_size(jcgi);
+        d->cgi = arena_alloc(a, sizeof(CgiProgram) * (nadd ? nadd : 1));
+        if (!d->cgi) return NULL;
         for (size_t i = 0; i < nadd; i++) {
             json_t *e = json_array_get(jcgi, i);
             const char *name = j_str(e, "name");
             if (!name) continue;
-
-            int found = -1;
-            for (int k = 0; k < d->n_cgi; k++)
-                if (d->cgi[k].name && !strcmp(d->cgi[k].name, name)) {
-                    found = k; break;
-                }
-
-            if (j_true(e, "disabled")) {
-                if (found >= 0) {
-                    memmove(&d->cgi[found], &d->cgi[found + 1],
-                            sizeof(CgiProgram) * (d->n_cgi - found - 1));
-                    d->n_cgi--;
-                }
-                continue;
-            }
-
-            CgiProgram *slot;
-            if (found >= 0) {
-                slot = &d->cgi[found];
-            } else {
-                CgiProgram *nc = arena_alloc(a, sizeof(CgiProgram) * (d->n_cgi + 1));
-                if (d->n_cgi) memcpy(nc, d->cgi, sizeof(CgiProgram) * d->n_cgi);
-                d->cgi = nc;
-                slot = &d->cgi[d->n_cgi++];
-            }
+            CgiProgram *slot = &d->cgi[d->n_cgi++];
+            memset(slot, 0, sizeof(*slot));
             slot->name = arena_strdup(a, name);
             const char *pp = j_str(e, "path");
             slot->path = pp ? arena_strdup(a, pp) : NULL;
@@ -832,7 +788,7 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
 	    continue;
         }
 
-        /* ---- CGI dispatch (per-dir, inherited) ---- */
+        /* ---- CGI dispatch (per-dir) ---- */
         {
             const char *rest_n = rest;
             while (*rest_n == '/') rest_n++;
@@ -1093,8 +1049,51 @@ static void drop_to(const char *user) {
     if (setuid(pw->pw_uid) < 0) { perror("setuid"); exit(1); }
 }
 
+static void usage(FILE *out) {
+    fprintf(out,
+        "Usage: corehttpd [OPTIONS] [CONFIG]\n"
+        "\n"
+        "Minimal HTTP/1.1 + TLS 1.3 web server.\n"
+        "\n"
+        "Arguments:\n"
+        "  CONFIG              path to the JSONC configuration file\n"
+        "                      (default: /etc/corehttpd/config.jsonc)\n"
+        "\n"
+        "Options:\n"
+        "  -h, --help          show this help and exit\n"
+        "\n"
+        "corehttpd must be started as root: it binds ports 80 and 443 and\n"
+        "then drops privileges to the user configured as httpd_user.  The\n"
+        "TLS certificate and private key are read once by the master\n"
+        "process at startup, so the private key does not need to be\n"
+        "readable by the httpd user.\n"
+        "\n"
+        "Signals:\n"
+        "  SIGTERM, SIGINT     graceful shutdown: let the current request\n"
+        "                      finish, stop the CGI broker, exit\n"
+        "\n"
+        "Examples:\n"
+        "  corehttpd\n"
+        "  corehttpd /etc/corehttpd/config.jsonc\n"
+        "\n"
+        "See the README for the configuration file format.\n");
+}
+
 int main(int argc, char **argv) {
-    const char *cfgpath = argc > 1 ? argv[1] : "/etc/corehttpd/config.jsonc";
+    const char *cfgpath = "/etc/corehttpd/config.jsonc";
+
+    if (argc > 1) {
+        if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
+            usage(stdout);
+            return 0;
+        }
+        if (argv[1][0] == '-') {
+            fprintf(stderr, "corehttpd: unknown option: %s\n", argv[1]);
+            usage(stderr);
+            return 1;
+        }
+        cfgpath = argv[1];
+    }
 
     /* EPIPE instead of SIGPIPE death when a client goes away mid-write */
     signal(SIGPIPE, SIG_IGN);

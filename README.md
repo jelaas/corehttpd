@@ -48,7 +48,8 @@ corehttpd must be started as root, because it binds ports 80 and 443:
 ./corehttpd [/path/to/config.jsonc]
 ```
 
-If no path is given, `/etc/corehttpd/config.jsonc` is used.
+If no path is given, `/etc/corehttpd/config.jsonc` is used. Running
+`corehttpd -h` (or `--help`) prints a short usage summary.
 
 The server consists of three processes:
 
@@ -69,9 +70,16 @@ connection is served synchronously within one process).
 
 ### systemd example
 
+A template unit makes it easy to run several corehttpd instances for
+concurrent request handling: the listening sockets use `SO_REUSEPORT`,
+so all instances bind the same ports 80/443 and the kernel distributes
+incoming connections across them.
+
+`/etc/systemd/system/corehttpd@.service`:
+
 ```ini
 [Unit]
-Description=corehttpd
+Description=corehttpd instance %i
 After=network.target
 
 [Service]
@@ -81,6 +89,16 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 ```
+
+Start e.g. four instances (each runs its own master, httpd and CGI
+broker processes):
+
+```sh
+systemctl enable --now corehttpd@{1,2,3,4}
+```
+
+The number of instances is a scaling knob; any of them can be stopped or
+started at any time without disturbing the others.
 
 ## Configuration
 
@@ -151,7 +169,6 @@ The configuration file is **JSONC** — JSON with C-style comments
           "name": "admin",
           "auth": { "user": "admin", "pass": "hunter2" },
           "ip_allow": ["10.0.0.0/8"],
-          "cgi_clear": true,           // drop inherited CGI programs
           "cgi": [
             { "name": "backup.cgi", "user": "backup" }
           ]
@@ -187,10 +204,8 @@ Restrictions are inherited and can only become **stricter**:
 - **auth** — a child without its own `auth` block inherits the parent's.
 - **ip_allow** — a child's list is *intersected* with the parent's.
 - **timeouts** — freely adjustable per directory (inherited).
-- **cgi** — a child inherits the parent's CGI programs; entries with the
-  same `name` are overridden, `"disabled": true` removes an entry, and
-  `cgi_clear: true` drops everything inherited before applying the
-  child's own list.
+- **cgi** — a directory's CGI programs apply **only to that directory**;
+  they are not inherited by subdirectories.
 
 ### Timeouts
 
@@ -208,8 +223,7 @@ A CGI program is activated by listing it in `cgi`:
   "name": "gen.cgi",        // URL path component(s), e.g. "sub/gen.cgi"
   "path": "/opt/bin/gen",   // optional: absolute, or relative to the dir;
                             // omit to execute the matched file itself
-  "user": "www-data",       // optional: user to run as (default: cgi_user)
-  "disabled": true          // optional: remove an inherited entry
+  "user": "www-data"        // optional: user to run as (default: cgi_user)
 }
 ```
 

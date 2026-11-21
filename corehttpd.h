@@ -15,8 +15,8 @@ void  arena_reset(Arena *);
 /* ---------- config ---------- */
 typedef struct Acl { uint32_t net, mask; } Acl;   /* host byte order */
 
-/* Per-directory CGI program entry.  Lives inside DirCfg; inherited by
- * children like auth is, and can be overridden or disabled per subtree. */
+/* Per-directory CGI program entry.  Lives inside DirCfg and applies only
+ * to its own directory: it is not inherited by subdirectories. */
 typedef struct CgiProgram {
     const char *name;   /* relative name inside the dir, e.g. "gen.cgi" or
                            "sub/gen.cgi".  Longest match wins, so
@@ -37,7 +37,7 @@ typedef struct DirCfg {
     int         header_timeout;
     int         body_timeout;
     int         keepalive_timeout;
-    CgiProgram *cgi; int n_cgi;          /* effective (inherited+merged) */
+    CgiProgram *cgi; int n_cgi;          /* this directory's own CGI programs */
     struct DirCfg **subdirs; int n_subdirs;
 } DirCfg;
 
