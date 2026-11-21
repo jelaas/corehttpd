@@ -1100,7 +1100,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
     Arena master_arena;
-    arena_init(&master_arena, 4u << 20);
+    arena_init(&master_arena, 10u << 20);
     Config *cfg = config_load(&master_arena, cfgpath);
     if (!cfg) { fprintf(stderr, "config load failed\n"); return 1; }
 

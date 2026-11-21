@@ -1,0 +1,58 @@
+Write a webserver called corehttpd handling only HTTP 1.1.
+
+Write in C. only dependency allowed is libjansson for json.
+Target is static compiling against musl libc.
+
+Support only IPv4.
+
+All configuration is done in jsonc (that is json with C-style comment support).
+
+memory management is done by using one arena allocation that is made at start.
+all allocations for handling a request is done using the arena, and all memory is freed from the arena after the request ends.
+when the arena is allocated or reset it shall zero the memory in the whole arena.
+all allocations whether from the arena or not must be checked for failed allocations.
+if arena allocation failed the request should be aborted.
+if non-arena (system) allocation fails the whole application (all processes) should exit.
+integer overflows must be guarded against, especially for memory allocation.
+if a request would need to be truncated, we should instead reject it.
+
+the webserver consists of a master process running as root.
+the master process opens the ports 80 and 443 and hands them to the httpd subprocess.
+the ports are opened with SO_REUSEPORT so we can handle concurrent request by starting more processes. Starting processes is done by the administrator not by the application.
+the httpd subprocess handles http/https requests.
+each request is handled by the the same process (the httpd process) no forking or creating of threads.
+the httpd subprocess runs as the httpd user which is unpriviliged.
+http basic authentication is supported and everything needed for this is configured in jsonc.
+password check for authentication must use a constant-time password comparison.
+There should be diferent timeouts for connect and body plus any other that seems reasonable.
+CGI-call must also handle timeouts.
+
+The configuration should use a hierarchy in json: sitename (virtual host) -> documentroot -> subdir -> subdir and so on.
+Subdirs on the same level are configured using an array.
+All restrictions to access is inherited along the hierarchy and can only get stricter.
+Timeouts can be adjusted to be either longer or shorter along the hierarchy (does not count as restrictions).
+support for restricting access by IP-adress or IP-network n.n.n.n/n
+index.html supported, but no directory listing.
+
+HTTPS need only support the minimal amount of ciphers etc so that a late version of firefox can connect.
+the application may use the cli program "openssl" for reading/importing certficate keys if that is easier than implementing it itself.
+
+a GET request to port 80 always emit a redirect to HTTPS with the same request but with http changed to https.
+there is an exception to the rewrite and that is if the request looks lika letsencrypt verification request, in that case it will deliver a HTTP answer for the request where the letsencrypt file is read from a special location on disk.
+port 80 does not support POST, only GET and HEAD.
+
+All HTTP/HTTPS requests should check for parse traversal attacks and reject these. Reject ./ or ../ components.
+
+
+CGI-support.
+CGI is handled by a process that the master process forks at start.
+The httpd process can communicate with the cgi process using sockets handed to them from the master process.
+httpd sends a request for running a CGI-program to the cgi process. this requests also contains information about
+which user the CGI-program should be run as. Activation of cgi and which programs and users should be used is all in the
+httpd process jsonc configuration.
+CGI configuration such as which programs are allowed and which user to run as should be part of the hierarchy.
+So for example you can in one subdir specify that a certain file in that dir is a CGI-program and which user to run it as.
+The CGI broker/process should also if possible use an arena allocator.
+
+If the master process receives a SIGTERM signal it sends this on to the httpd process, which waits until a running request is done, then exits. when httpd process has exited the master process kills the cgi process and  then exits.
+
