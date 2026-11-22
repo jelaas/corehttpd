@@ -275,6 +275,27 @@ Directories are nested through the `subdirs` array; each entry has a
 `name` (the URL component) and an optional `documentroot` (default:
 parent path + `/<name>`).
 
+A subdir `name` may be a **glob pattern** with `*` (any run of
+characters) and `?` (one character) — useful to cover many similarly
+named directories at once:
+
+```jsonc
+"subdirs": [
+  { "name": "0*", "auth": { "user": "bob", "pass": "builder" } },
+  { "name": "*.cgi-bin", "ip_allow": ["10.0.0.0/8"] }
+]
+```
+
+`0*` matches every URL component starting with `0`; all settings of
+the matched entry (auth, ACLs, timeouts, CGI) apply to every match.
+Rules: literal names win over patterns, the *longest* matching pattern
+wins, ties go to the first entry in the config. For pattern entries
+without an explicit `documentroot`, the filesystem path is derived from
+the *actual matched component* (so `0*` matching `0123` maps to
+`<parent>/0123`), including for nested patterns. Names that contain `*`
+or `?` are always treated as patterns — literal directories with those
+characters in the name cannot be configured.
+
 A site may carry its own TLS certificate (`cert_file`/`key_file`, always
 a pair). The certificate is chosen during the TLS handshake from the
 client's SNI server name; see "TLS / HTTPS" below. Sites without their

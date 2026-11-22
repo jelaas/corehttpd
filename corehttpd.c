@@ -180,15 +180,22 @@ static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
 
     /* ---- filesystem path ---- */
     const char *dr = j_str(j, "documentroot");
-    if (dr) d->path = arena_strdup(a, dr);
-    else if (parent) {
-        size_t pl = strlen(parent->path), nl = d->name ? strlen(d->name) : 0;
+    if (dr) {
+        d->path = arena_strdup(a, dr);
+    } else if (parent && parent->path &&
+               !(nm && (strchr(nm, '*') || strchr(nm, '?')))) {
+        size_t pl = strlen(parent->path), nl = nm ? strlen(nm) : 0;
         char *p = arena_alloc(a, pl + nl + 2);
+        if (!p) return NULL;
         memcpy(p, parent->path, pl);
         p[pl] = '/';
-        if (nl) memcpy(p + pl + 1, d->name, nl);
+        if (nl) memcpy(p + pl + 1, nm, nl);
         p[pl + nl + 1] = 0;
         d->path = p;
+    } else if (parent) {
+        /* glob name (or a child of one): the real filesystem path is
+         * derived per request from the matched URL component */
+        d->path = NULL;
     } else d->path = arena_strdup(a, "/");
 
     /* ---- auth: monotonic ---- */
@@ -421,22 +428,92 @@ SiteCfg *config_find_site(Config *c, const char *host) {
     return c->n_sites ? c->sites[0] : NULL;
 }
 
-DirCfg *config_walk(DirCfg *root, char *path, char **rest) {
-    char *p = path; DirCfg *cur = root;
+/* simple glob: '*' matches any run (possibly empty), '?' one char */
+static int glob_match(const char *pat, const char *s, size_t slen) {
+    size_t si = 0;
+    const char *star = NULL;
+    size_t backi = 0;
+    const char *p = pat;
+    while (si < slen) {
+        if (*p == '?' || *p == s[si]) {
+            p++;
+            si++;
+        } else if (*p == '*') {
+            star = p++;
+            backi = si;
+        } else if (star) {
+            p = star + 1;
+            backi++;
+            si = backi;
+        } else {
+            return 0;
+        }
+    }
+    while (*p == '*') p++;
+    return *p == 0;
+}
+
+DirCfg *config_walk(DirCfg *root, char *path, char **rest,
+                    char *fs_buf, size_t fs_cap) {
+    DirCfg *cur = root;
+    size_t flen = 0;
+    if (root->path) {
+        flen = strlen(root->path);
+        if (flen + 1 > fs_cap) return NULL;
+        memcpy(fs_buf, root->path, flen + 1);
+    } else {
+        if (fs_cap < 1) return NULL;
+        fs_buf[0] = 0;
+    }
+
+    char *p = path;
     while (*p) {
         while (*p == '/') p++;
         if (!*p) break;
         char *slash = strchr(p, '/');
         size_t clen = slash ? (size_t)(slash - p) : strlen(p);
+
         DirCfg *m = NULL;
+        /* exact literal names win over patterns */
         for (int i = 0; i < cur->n_subdirs; i++) {
-            size_t nl = strlen(cur->subdirs[i]->name);
-            if (nl == clen && !memcmp(cur->subdirs[i]->name, p, clen)) {
-                m = cur->subdirs[i]; break;
+            const char *n = cur->subdirs[i]->name;
+            if (!n) continue;
+            if (strlen(n) == clen && !memcmp(n, p, clen) &&
+                !strchr(n, '*') && !strchr(n, '?')) {
+                m = cur->subdirs[i];
+                break;
+            }
+        }
+        if (!m) {
+            /* otherwise the longest matching glob pattern */
+            size_t best = 0;
+            for (int i = 0; i < cur->n_subdirs; i++) {
+                const char *n = cur->subdirs[i]->name;
+                if (!n) continue;
+                if ((strchr(n, '*') || strchr(n, '?')) &&
+                    glob_match(n, p, clen) && strlen(n) > best) {
+                    m = cur->subdirs[i];
+                    best = strlen(n);
+                }
             }
         }
         if (!m) break;
-        cur = m; p += clen;
+        cur = m;
+        if (cur->path) {
+            /* static path (explicit documentroot or derived) */
+            size_t pl = strlen(cur->path);
+            if (pl + 1 > fs_cap) return NULL;
+            memcpy(fs_buf, cur->path, pl + 1);
+            flen = pl;
+        } else {
+            /* glob dir: the path grows by the matched component */
+            if (flen + clen + 2 > fs_cap) return NULL;
+            fs_buf[flen++] = '/';
+            memcpy(fs_buf + flen, p, clen);
+            flen += clen;
+            fs_buf[flen] = 0;
+        }
+        p += clen;
     }
     *rest = p;
     return cur;
@@ -756,7 +833,10 @@ static int serve_file(Conn *c, const char *root, const char *fullpath,
     struct stat st;
     if (stat(fullpath, &st) < 0) return -1;
     if (!S_ISREG(st.st_mode)) return -1;
-    if (!path_within_root(root, fullpath)) return -1;
+    if (!path_within_root(root, fullpath)) {
+        errno = EACCES;      /* resolved outside the root: forbidden */
+        return -1;
+    }
     int f = open(fullpath, O_RDONLY | O_NOFOLLOW);
     if (f < 0) return -1;
 
@@ -993,10 +1073,20 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
 
         /* mutate a scratch copy of the path for walking */
         char *path_scratch = arena_strdup(ctx->arena, req.path);
-        char *rest = NULL;
-        DirCfg *eff = config_walk(site->root, path_scratch, &rest);
-
         int head_only = !strcmp(req.method, "HEAD");
+        char *rest = NULL;
+        char fs_path[2048];
+        DirCfg *eff = config_walk(site->root, path_scratch, &rest,
+                                  fs_path, sizeof fs_path);
+        if (!eff) {
+            status = 414;
+            http_send_simple(&conn, 414, "URI Too Long", NULL,
+                             "uri too long\n", 13, head_only);
+            access_log_request(ctx, &peer, &req, NULL, status,
+                               conn.nbytes - bytes0);
+            if (!req.keep_alive) break;
+            continue;
+        }
 
         /* ---- port 80: redirect / letsencrypt / GET-HEAD only ---- */
         if (!is_tls) {
@@ -1067,15 +1157,28 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
                  * or the matched file under the effective dir. */
                 char prog_path[2048];
                 if (cp->path) {
-                    if (cp->path[0] == '/')
-                        snprintf(prog_path, sizeof(prog_path), "%s", cp->path);
-                    else
-                        snprintf(prog_path, sizeof(prog_path), "%s/%s",
-                                 eff->path, cp->path);
+                    const char *pp = cp->path;
+                    size_t l = strlen(pp);
+                    if (pp[0] == '/') {
+                        if (l + 1 > sizeof(prog_path)) goto cgi_toolong;
+                        memcpy(prog_path, pp, l + 1);
+                    } else {
+                        size_t fl2 = strlen(fs_path);
+                        if (fl2 + 1 + l + 1 > sizeof(prog_path))
+                            goto cgi_toolong;
+                        memcpy(prog_path, fs_path, fl2);
+                        prog_path[fl2] = '/';
+                        memcpy(prog_path + fl2 + 1, pp, l + 1);
+                    }
                 } else {
                     size_t plen = (size_t)(path_info - rest_n);
-                    snprintf(prog_path, sizeof(prog_path), "%s/%.*s",
-                             eff->path, (int)plen, rest_n);
+                    size_t fl2 = strlen(fs_path);
+                    if (fl2 + 1 + plen + 1 > sizeof(prog_path))
+                        goto cgi_toolong;
+                    memcpy(prog_path, fs_path, fl2);
+                    prog_path[fl2] = '/';
+                    memcpy(prog_path + fl2 + 1, rest_n, plen);
+                    prog_path[fl2 + 1 + plen] = 0;
                 }
 
                 const char *user = cp->user ? cp->user : ctx->cfg->cgi_user;
@@ -1110,7 +1213,7 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
                 env[ne++] = t;
                 if (!(t = arena_sprintf(ctx->arena, "SCRIPT_FILENAME=%s", prog_path))) goto cgi_nomem;
                 env[ne++] = t;
-                if (!(t = arena_sprintf(ctx->arena, "DOCUMENT_ROOT=%s", eff->path))) goto cgi_nomem;
+                if (!(t = arena_sprintf(ctx->arena, "DOCUMENT_ROOT=%s", fs_path))) goto cgi_nomem;
                 env[ne++] = t;
                 if (path_info && *path_info) {
                     if (!(t = arena_sprintf(ctx->arena, "PATH_INFO=%s", path_info))) goto cgi_nomem;
@@ -1136,7 +1239,7 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
 
         /* ---- static file ---- */
         char full[2048];
-        int fl = snprintf(full, sizeof(full), "%s/%s", eff->path, rest);
+        int fl = snprintf(full, sizeof(full), "%s/%s", fs_path, rest);
         if (fl < 0 || (size_t)fl >= sizeof(full)) {
             status = 414;
             http_send_simple(&conn, 414, "URI Too Long", NULL, "uri too long\n", 13, head_only);
@@ -1158,16 +1261,29 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
                 continue;
             }
             memcpy(full + flen, suffix, sizeof(suffix));
-            if (serve_file(&conn, eff->path, full, head_only) < 0) {
-                status = 403;
-                http_send_simple(&conn, 403, "Forbidden", NULL, "forbidden\n", 10, head_only);
+            if (serve_file(&conn, fs_path, full, head_only) < 0) {
+                /* a missing index.html is "not found"; an unreadable
+                 * file is "forbidden" (the httpd process reads files —
+                 * authentication does not grant filesystem access) */
+                int nf = (errno == ENOENT || errno == ENOTDIR);
+                status = nf ? 404 : 403;
+                log_debug("client %s: %s: %s", ip, full, strerror(errno));
+                http_send_simple(&conn, status,
+                                 nf ? "Not Found" : "Forbidden", NULL,
+                                 nf ? "not found\n" : "forbidden\n", 10,
+                                 head_only);
             } else {
                 status = 200;
             }
         } else {
-            if (serve_file(&conn, eff->path, full, head_only) < 0) {
-                status = 404;
-                http_send_simple(&conn, 404, "Not Found", NULL, "not found\n", 10, head_only);
+            if (serve_file(&conn, fs_path, full, head_only) < 0) {
+                int nf = (errno == ENOENT || errno == ENOTDIR);
+                status = nf ? 404 : 403;
+                log_debug("client %s: %s: %s", ip, full, strerror(errno));
+                http_send_simple(&conn, status,
+                                 nf ? "Not Found" : "Forbidden", NULL,
+                                 nf ? "not found\n" : "forbidden\n", 10,
+                                 head_only);
             } else {
                 status = 200;
             }
@@ -1180,6 +1296,14 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
 cgi_nomem:
         status = 500;
         http_send_simple(&conn, 500, "Internal Server Error", NULL, "nomem\n", 6, head_only);
+        access_log_request(ctx, &peer, &req, auth_user, status,
+                           conn.nbytes - bytes0);
+        if (!req.keep_alive) break;
+        continue;
+
+cgi_toolong:
+        status = 502;
+        http_send_simple(&conn, 502, "Bad Gateway", NULL, "cgi\n", 4, head_only);
         access_log_request(ctx, &peer, &req, auth_user, status,
                            conn.nbytes - bytes0);
         if (!req.keep_alive) break;

@@ -69,8 +69,11 @@ typedef struct Config {
 
 Config *config_load(Arena *, const char *path);
 SiteCfg *config_find_site(Config *, const char *host);
-/* walk URL path against hierarchy; fills *rest with remaining file part */
-DirCfg *config_walk(DirCfg *root, char *path_scratch, char **rest);
+/* walk URL path against hierarchy; fills *rest with remaining file part
+ * and fs_buf with the effective filesystem path (for glob subdirs the
+ * path is derived from the actual matched component); NULL on overflow */
+DirCfg *config_walk(DirCfg *root, char *path_scratch, char **rest,
+                    char *fs_buf, size_t fs_cap);
 
 /* ---------- http ---------- */
 typedef struct TlsConn TlsConn;   /* from tls.c */
