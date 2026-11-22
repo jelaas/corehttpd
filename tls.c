@@ -1467,6 +1467,7 @@ static unsigned char *msg_start(Arena *a, unsigned char type, size_t bodylen) {
  * handshake (RFC 8446)
  * ===================================================================== */
 TlsConn *tls_server_handshake(Arena *a, int fd, const TlsKey *key,
+                              tls_pick_key_fn pick, void *pick_arg,
                               int timeout) {
     if (!key) return NULL;
 
@@ -1510,6 +1511,9 @@ TlsConn *tls_server_handshake(Arena *a, int fd, const TlsKey *key,
 
     int has_13 = 0, has_x25519 = 0, has_ecdsa = 0;
     unsigned char client_pub[32];
+    char sni[256];
+    int has_sni = 0;
+    sni[0] = 0;
     if (off + 2 <= blen) {
         unsigned ext_len = get_u16(body + off); off += 2;
         if (off + ext_len > blen) goto fail;
@@ -1542,12 +1546,39 @@ TlsConn *tls_server_handshake(Arena *a, int fd, const TlsKey *key,
                 unsigned n = get_u16(body + off);
                 for (unsigned i = 0; i < n && 2 + 2 * (i + 1) <= el; i++)
                     if (get_u16(body + off + 2 + 2 * i) == 0x0403) has_ecdsa = 1;
+            } else if (et == 0 && el >= 5) {           /* server_name (SNI) */
+                /* ServerNameList: uint16 length, then one or more entries
+                 * (uint8 NameType, uint16 len, name).  We take the first
+                 * host_name; the other types are defined to be illegal. */
+                unsigned nl = get_u16(body + off);
+                size_t p = off + 2, nend = p + nl;
+                if (nend <= off + el) {
+                    while (p + 3 <= nend) {
+                        unsigned nt = body[p];
+                        unsigned nn = get_u16(body + p + 1);
+                        if (p + 3 + nn > nend) break;
+                        if (nt == 0 && nn > 0 && nn < sizeof(sni)) {
+                            memcpy(sni, body + p + 3, nn);
+                            sni[nn] = 0;
+                            has_sni = 1;
+                            break;
+                        }
+                        p += 3 + nn;
+                    }
+                }
             }
             off += el;
         }
     }
     if (!has_13) { alert = 70; goto fail; }            /* protocol_version */
     if (!has_x25519 || !has_ecdsa) goto fail;
+
+    /* pick the certificate: SNI -> site key, otherwise the default */
+    const TlsKey *skey = key;
+    if (pick && has_sni) {
+        const TlsKey *k = pick(sni, pick_arg);
+        if (k) skey = k;
+    }
 
     /* ---- key schedule: early/handshake secrets ---- */
     Sha256 tr;
@@ -1612,10 +1643,10 @@ TlsConn *tls_server_handshake(Arena *a, int fd, const TlsKey *key,
     sha256_update(&tr, ee, eelen);
 
     /* ---- Certificate ---- */
-    int ncert = key->n_certs;
+    int ncert = skey->n_certs;
     if (ncert <= 0) goto fail;
     size_t listlen = 0;
-    for (int i = 0; i < ncert; i++) listlen += 3 + key->len[i] + 2;
+    for (int i = 0; i < ncert; i++) listlen += 3 + skey->len[i] + 2;
     unsigned char *certmsg = msg_start(a, 11, 1 + 3 + listlen);
     if (!certmsg) goto fail;
     {
@@ -1623,10 +1654,10 @@ TlsConn *tls_server_handshake(Arena *a, int fd, const TlsKey *key,
         *p++ = 0;                                      /* request context */
         put_u24(p, (unsigned)listlen); p += 3;
         for (int i = 0; i < ncert; i++) {
-            put_u24(p, (unsigned)key->len[i]);
-            memcpy(p + 3, key->der[i], key->len[i]);
-            put_u16(p + 3 + key->len[i], 0);           /* no entry extensions */
-            p += 3 + key->len[i] + 2;
+            put_u24(p, (unsigned)skey->len[i]);
+            memcpy(p + 3, skey->der[i], skey->len[i]);
+            put_u16(p + 3 + skey->len[i], 0);          /* no entry extensions */
+            p += 3 + skey->len[i] + 2;
         }
     }
     size_t certlen = 4 + 1 + 3 + listlen;
@@ -1647,7 +1678,7 @@ TlsConn *tls_server_handshake(Arena *a, int fd, const TlsKey *key,
     {
         unsigned char digest[32];
         sha256_one(digest, cvcontent, 64 + 33 + 1 + 32);
-        if (ecdsa_sign(sigbuf, &siglen, key->priv, digest) < 0) goto fail;
+        if (ecdsa_sign(sigbuf, &siglen, skey->priv, digest) < 0) goto fail;
     }
     unsigned char *cv = msg_start(a, 15, 2 + 2 + siglen);
     if (!cv) goto fail;

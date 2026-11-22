@@ -234,6 +234,26 @@ static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
     return d;
 }
 
+/* (cert,key) filename pair -> loaded key; dedupes shared certificates so
+ * the master arena is not wasted on duplicates */
+struct KeyEnt { const char *cf, *kf; TlsKey *key; };
+
+static TlsKey *key_load_cached(Arena *a, const char *cf, const char *kf,
+                               struct KeyEnt *keys, size_t *nkeys) {
+    for (size_t i = 0; i < *nkeys; i++)
+        if (!strcmp(keys[i].cf, cf) && !strcmp(keys[i].kf, kf))
+            return keys[i].key;
+    TlsKey *k = tls_load_key(a, cf, kf);
+    if (!k) return NULL;
+    if (*nkeys < 128) {
+        keys[*nkeys].cf = cf;
+        keys[*nkeys].kf = kf;
+        keys[*nkeys].key = k;
+        (*nkeys)++;
+    }
+    return k;
+}
+
 Config *config_load(Arena *a, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return NULL; }
@@ -278,9 +298,52 @@ Config *config_load(Arena *a, const char *path) {
         for (size_t i = 0; i < n; i++) {
             json_t *s = json_array_get(sites, i);
             SiteCfg *sc = arena_alloc(a, sizeof(*sc));
+            memset(sc, 0, sizeof(*sc));
             sc->name = arena_strdup(a, j_str(s, "name"));
+            sc->cert_file = arena_strdup(a, j_str(s, "cert_file"));
+            sc->key_file  = arena_strdup(a, j_str(s, "key_file"));
             sc->root = parse_dir(a, s, NULL, c, NULL);
             c->sites[c->n_sites++] = sc;
+        }
+    }
+
+    /* ---- TLS material ----
+     * Loaded here, once, by the master.  The global cert/key pair is the
+     * default certificate; sites may provide their own pair, selected via
+     * SNI during the handshake.  Identical (cert,key) pairs are loaded
+     * only once. */
+    struct KeyEnt keys[128];
+    size_t nkeys = 0;
+    if (c->cert_file || c->key_file) {
+        if (!c->cert_file || !c->key_file) {
+            fprintf(stderr, "config: need both cert_file and key_file\n");
+            json_decref(root);
+            return NULL;
+        }
+        c->tls_key = key_load_cached(a, c->cert_file, c->key_file, keys, &nkeys);
+        if (!c->tls_key) {
+            fprintf(stderr, "config: failed to load TLS key\n");
+            json_decref(root);
+            return NULL;
+        }
+    }
+    for (int i = 0; i < c->n_sites; i++) {
+        SiteCfg *sc = c->sites[i];
+        if (sc->cert_file || sc->key_file) {
+            if (!sc->cert_file || !sc->key_file) {
+                fprintf(stderr, "config: site %s: need both cert_file and key_file\n",
+                        sc->name ? sc->name : "?");
+                json_decref(root);
+                return NULL;
+            }
+            sc->tls_key = key_load_cached(a, sc->cert_file, sc->key_file,
+                                          keys, &nkeys);
+            if (!sc->tls_key) {
+                fprintf(stderr, "config: site %s: failed to load TLS key\n",
+                        sc->name ? sc->name : "?");
+                json_decref(root);
+                return NULL;
+            }
         }
     }
     json_decref(root);
@@ -289,8 +352,15 @@ Config *config_load(Arena *a, const char *path) {
 
 SiteCfg *config_find_site(Config *c, const char *host) {
     if (!host) return c->n_sites ? c->sites[0] : NULL;
+    /* IPv4 only: a ':' means a trailing port ("name:443"), which is
+     * ignored for the site match */
+    size_t hlen = strlen(host);
+    const char *colon = memchr(host, ':', hlen);
+    if (colon) hlen = (size_t)(colon - host);
     for (int i = 0; i < c->n_sites; i++)
-        if (!strcasecmp(c->sites[i]->name, host)) return c->sites[i];
+        if (strlen(c->sites[i]->name) == hlen &&
+            !strncasecmp(c->sites[i]->name, host, hlen))
+            return c->sites[i];
     return c->n_sites ? c->sites[0] : NULL;
 }
 
@@ -313,6 +383,17 @@ DirCfg *config_walk(DirCfg *root, char *path, char **rest) {
     }
     *rest = p;
     return cur;
+}
+
+/* SNI -> certificate for the handshake: the named site's own cert, or
+ * the default certificate when the name is unknown or absent */
+static const TlsKey *pick_site_key(const char *sni, void *arg) {
+    Config *cfg = arg;
+    if (sni && *sni) {
+        SiteCfg *s = config_find_site(cfg, sni);
+        if (s && s->tls_key) return s->tls_key;
+    }
+    return cfg->tls_key;
 }
 
 /* =====================================================================
@@ -788,6 +869,7 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
     Conn conn = { fd, NULL, 0 };
     if (is_tls) {
         conn.tls = tls_server_handshake(ctx->arena, fd, ctx->cfg->tls_key,
+                                        pick_site_key, ctx->cfg,
                                         ctx->cfg->def_header_timeout);
         if (!conn.tls) {
             log_warn("TLS handshake failed (client %s)", ip);
@@ -1515,20 +1597,17 @@ int main(int argc, char **argv) {
     Config *cfg = config_load(&master_arena, cfgpath);
     if (!cfg) { log_err("config load failed"); return 1; }
 
-    /* the master reads the TLS material once and passes it to the
-     * httpd child; the unprivileged child never touches the files */
-    if (cfg->cert_file || cfg->key_file) {
-        if (!cfg->cert_file || !cfg->key_file) {
-            log_err("config: need both cert_file and key_file");
-            return 1;
-        }
-        cfg->tls_key = tls_load_key(&master_arena,
-                                    cfg->cert_file, cfg->key_file);
-        if (!cfg->tls_key) {
-            log_err("config: failed to load TLS key");
-            return 1;
-        }
+    /* default certificate for connections without (or with unknown) SNI:
+     * the global cert, or failing that the first site's certificate */
+    if (!cfg->tls_key) {
+        for (int i = 0; i < cfg->n_sites; i++)
+            if (cfg->sites[i]->tls_key) {
+                cfg->tls_key = cfg->sites[i]->tls_key;
+                break;
+            }
     }
+    if (!cfg->tls_key)
+        log_warn("no TLS certificate configured; port 443 will reject connections");
 
     int access_fd = accesslog_open(cfg);
     if (access_fd < 0 && !daemon) {

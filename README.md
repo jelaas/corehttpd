@@ -173,12 +173,19 @@ The configuration file is **JSONC** — JSON with C-style comments
     "keepalive_timeout": 60   // reserved for the next request
   },
 
-  // Virtual hosts, matched against the HTTP Host header.
+  // Virtual hosts, matched against the HTTP Host header (and, for TLS
+  // certificate selection, against the SNI server name).
   // The first site is the fallback for unknown hosts.
   "sites": [
     {
       "name": "example.com",
       "documentroot": "/srv/www/example.com",
+
+      // Optional per-site TLS certificate.  When a client connects with
+      // SNI "example.com", this certificate is served instead of the
+      // global one.  Omit to use the global cert_file/key_file.
+      "cert_file": "/etc/corehttpd/certs/example.com.pem",
+      "key_file":  "/etc/corehttpd/certs/example.com.key",
 
       // Basic authentication (optional).  Inherited by all subdirectories
       // unless a subdirectory defines its own auth block.
@@ -227,7 +234,7 @@ The configuration file is **JSONC** — JSON with C-style comments
 |--------------------|-----------------------------------------------------|-----------------------|
 | `httpd_user`       | user the httpd process runs as                     | `nobody`              |
 | `cgi_user`         | fallback user for CGI programs                     | `nobody`              |
-| `cert_file`        | PEM certificate chain (or single DER)              | —                     |
+| `cert_file`        | PEM certificate chain (or single DER); the default cert | —               |
 | `key_file`         | PEM/DER EC private key (P-256, SEC1 or PKCS#8)     | —                     |
 | `letsencrypt_root` | where ACME challenge files are read from           | `/var/www/letsencrypt`|
 | `access_log`       | access log file (absent = no access log)           | —                     |
@@ -240,9 +247,15 @@ The configuration file is **JSONC** — JSON with C-style comments
 ### Sites and directories
 
 Each site has a `name` (matched case-insensitively against the `Host`
-header) and a `documentroot`. Directories are nested through the
-`subdirs` array; each entry has a `name` (the URL component) and an
-optional `documentroot` (default: parent path + `/<name>`).
+header, with an optional `:port` suffix ignored) and a `documentroot`.
+Directories are nested through the `subdirs` array; each entry has a
+`name` (the URL component) and an optional `documentroot` (default:
+parent path + `/<name>`).
+
+A site may carry its own TLS certificate (`cert_file`/`key_file`, always
+a pair). The certificate is chosen during the TLS handshake from the
+client's SNI server name; see "TLS / HTTPS" below. Sites without their
+own certificate use the global one.
 
 Restrictions are inherited and can only become **stricter**:
 
@@ -381,14 +394,23 @@ master at startup.
 - The certificate **must be an ECDSA P-256 certificate** (e.g. a Let's
   Encrypt ECDSA certificate: point `cert_file` at `fullchain.pem` and
   `key_file` at `privkey.pem`). RSA certificates are not supported.
+- **Per-site certificates via SNI**: a site with `cert_file`/`key_file`
+  serves that certificate to clients whose ClientHello names the site
+  in SNI (every browser, curl, … does). Connections without SNI — or
+  with an unknown server name — get the default certificate: the global
+  `cert_file`/`key_file`, or the first site's certificate if no global
+  pair is configured. HTTP requests are still routed by the `Host`
+  header independently of which certificate was served.
 - The private key may be PEM (`BEGIN EC PRIVATE KEY` or
   `BEGIN PRIVATE KEY`, i.e. SEC1 or PKCS#8) or raw DER. The curve is
   validated; keys for other curves or algorithms are rejected at
   startup.
-- The master process loads and parses the certificate and key **once at
-  startup** and shares them with the httpd child, so the key file only
-  needs to be readable by root — the unprivileged httpd user never reads
-  it.
+- The master process loads and parses **every** certificate and key
+  (the global pair plus each site's own pair) **once at startup** and
+  shares them with the httpd child, so key files only need to be
+  readable by root — the unprivileged httpd user never reads them.
+  Identical `(cert_file, key_file)` pairs referenced by several sites
+  are loaded only once.
 - No PSK, session resumption, early data or ALPN. Clients get a fresh
   full handshake per connection, which is fine for browsers.
 - The `openssl` CLI is *not* required at runtime; it is only convenient
@@ -445,4 +467,6 @@ master at startup.
   freshly completed request may take up to a second to appear in the
   file.
 - Very large certificate chains: each file is limited to 1 MB and all
-  config/TLS material must fit in the master's 10 MB config arena.
+  config/TLS material (the global pair *plus every site's pair*) must
+  fit in the master's 10 MB config arena. Keep the total number of
+  sites with distinct certificates modest, or raise the arena.

@@ -41,7 +41,14 @@ typedef struct DirCfg {
     struct DirCfg **subdirs; int n_subdirs;
 } DirCfg;
 
-typedef struct SiteCfg { const char *name; DirCfg *root; } SiteCfg;
+typedef struct SiteCfg {
+    const char *name;
+    DirCfg *root;
+    /* optional per-site TLS material (SNI-selected); NULL => global */
+    const char *cert_file;
+    const char *key_file;
+    struct TlsKey *tls_key;
+} SiteCfg;
 
 struct TlsKey;   /* from tls.c */
 
@@ -105,7 +112,12 @@ typedef struct TlsKey {
 
 TlsKey *tls_load_key(Arena *, const char *cert_file, const char *key_file);
 
-TlsConn *tls_server_handshake(Arena *, int fd, const TlsKey *key, int timeout);
+/* callback for SNI-based certificate selection: return the key for the
+ * given server name (case-insensitive), or NULL to use the default */
+typedef const TlsKey *(*tls_pick_key_fn)(const char *sni, void *arg);
+
+TlsConn *tls_server_handshake(Arena *, int fd, const TlsKey *defkey,
+                              tls_pick_key_fn pick, void *arg, int timeout);
 ssize_t  tls_read (TlsConn *, void *, size_t);
 ssize_t  tls_write(TlsConn *, const void *, size_t);
 int      tls_pending(TlsConn *);
