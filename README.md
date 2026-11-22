@@ -42,6 +42,10 @@ Requirements:
 
 - a C11 compiler (the Makefile uses `musl-gcc`)
 - `libjansson` (static), e.g. `libjansson-dev` on Debian/Ubuntu
+- `corehttpd-acme` additionally needs the `curl` program and **up-to-date
+  CA certificates** on the system (curl verifies the ACME server's
+  certificate; on old systems the Let's Encrypt roots may be missing —
+  see the troubleshooting note in the ACME section)
 
 ```sh
 make
@@ -432,6 +436,11 @@ master at startup.
   starts with a warning and serves the default certificate for those
   sites (this is what makes the ACME HTTP-01 bootstrap possible, see
   below). Unreadable or invalid files, however, abort startup.
+- When no certificate is configured at all, connections to port 443 are
+  rejected with a proper TLS `handshake_failure` alert — clients fail
+  fast with a clear error instead of hanging. Connections that never
+  send a ClientHello (telnet, port scanners) are closed after a brief
+  2-second grace period.
 - No PSK, session resumption, early data or ALPN. Clients get a fresh
   full handshake per connection, which is fine for browsers.
 - The `openssl` CLI is *not* required at runtime; it is only convenient
@@ -535,13 +544,50 @@ name the output files (or the matching site's paths are used). Use
 untrusted certificates but has generous rate limits.
 
 The ACME account is identified by the account key; the first run
-creates it. Where it lives is resolved in this order: the `--account-key`
+creates it. `--contact` is only needed on that first run — it is stored
+with the account and later runs ignore it, so you can leave it out of
+cron jobs. (If you *do* pass it again it must be the same address: the
+ACME server rejects contact changes through `newAccount`.) Where the
+account key lives is resolved in this order: the `--account-key`
 option, then the `acme_account_key` entry in the configuration file,
 then `acme-account.pem` next to the configuration file. The config
 entry exists for machines whose root filesystem is mounted read-only —
 point it at a writable location (e.g. `/var/lib/corehttpd/`). If the
 account key is lost, a new account is created on the next run. Keep the
 account key file safe (mode 0600, root only).
+
+### From staging to production
+
+After a successful `--staging` test run, a *staging-issued* certificate
+is installed. If you then run without `--staging`, the renewal check
+would normally skip the still-valid certificate — but corehttpd-acme
+recognizes the Let's Encrypt staging CA in the certificate's issuer and
+replaces it automatically when talking to a non-staging directory:
+
+```sh
+corehttpd-acme                 # staging cert -> real cert, no flags needed
+```
+
+(Previously this required `--renew-days 0`; no longer.)
+
+### Troubleshooting
+
+- `cannot fetch directory ...: curl failed: ...` — the program shows
+  curl's own error message. Common causes:
+  - `cannot run curl: No such file or directory` — install curl.
+  - `Could not resolve host` — DNS problem.
+  - `SSL certificate problem ... unable to get local issuer
+    certificate` — the system's CA certificates are outdated (e.g. the
+    Let's Encrypt ISRG Root X1 missing on an old distribution). Fix it
+    properly with `apt update && apt install ca-certificates` (or the
+    equivalent), or point curl at a fresh CA bundle without touching
+    the system:
+
+    ```sh
+    SSL_CERT_FILE=/path/to/fresh-ca-bundle.crt corehttpd-acme
+    ```
+
+    (`CURL_CA_BUNDLE` works the same way.)
 
 ### Other ACME providers
 
@@ -576,7 +622,11 @@ certificates must still be ECDSA P-256 for corehttpd.
 - Directory requests serve `<dir>/index.html`; there is no directory
   listing.
 - Connections support HTTP keep-alive; the server processes requests on
-  a connection sequentially.
+  a connection sequentially. While waiting for the next request on an
+  idle keep-alive connection, the server watches the listening sockets
+  and drops the idle connection as soon as a new connection arrives —
+  so a client that keeps a connection open (e.g. after the port-80
+  redirect) never delays other clients.
 - Path traversal is rejected: `./`/`../` components and symlinks that
   escape the document root are denied (`403`/`404`).
 

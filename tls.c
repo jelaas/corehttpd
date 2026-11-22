@@ -1469,12 +1469,17 @@ static unsigned char *msg_start(Arena *a, unsigned char type, size_t bodylen) {
 TlsConn *tls_server_handshake(Arena *a, int fd, const TlsKey *key,
                               tls_pick_key_fn pick, void *pick_arg,
                               int timeout) {
-    if (!key) return NULL;
-
     TlsConn *c = calloc(1, sizeof(*c));
     if (!c) die_oom();
     c->fd = fd;
     c->timeout = timeout > 0 ? timeout : 10;
+    if (!key) {
+        /* no default certificate configured: still read the ClientHello
+         * so real TLS clients get a proper alert, but give idle TCP
+         * connections (telnet, port scanners) only a brief grace
+         * period before closing them */
+        c->timeout = 2;
+    }
     c->rbbuf = xmalloc(32768); c->rbcap = 32768;
     c->scratch = xmalloc(65536); c->scratchcap = 65536;
 
@@ -1578,6 +1583,12 @@ TlsConn *tls_server_handshake(Arena *a, int fd, const TlsKey *key,
     if (pick && has_sni) {
         const TlsKey *k = pick(sni, pick_arg);
         if (k) skey = k;
+    }
+    if (!skey) goto fail;      /* no certificate: handshake_failure alert */
+    if (!key) {
+        /* a site certificate was found via SNI: restore the normal
+         * timeouts for the rest of the handshake */
+        c->timeout = timeout > 0 ? timeout : 10;
     }
 
     /* ---- key schedule: early/handshake secrets ---- */

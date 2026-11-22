@@ -21,7 +21,7 @@
  *   download certificate chain.
  */
 
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1216,6 +1216,7 @@ typedef struct {
     char *hdr;      /* full header block, NUL-terminated */
     char *body;     /* response body, NUL-terminated */
     size_t bodylen;
+    char err[4096]; /* curl's stderr (diagnostics), NUL-terminated */
 } HttpResp;
 
 static void http_resp_free(HttpResp *r) {
@@ -1300,6 +1301,7 @@ static int http_req(HttpResp *r, const char *url, const char *post,
         args[na++] = (char *)url;
         args[na] = NULL;
         execvp("curl", args);
+        fprintf(stderr, "cannot run curl: %s\n", strerror(errno));
         _exit(127);
     }
 
@@ -1353,13 +1355,17 @@ static int http_req(HttpResp *r, const char *url, const char *post,
     r->body[bodylen] = 0;
     r->bodylen = bodylen;
 
-    /* drain curl's stderr (diagnostics, discarded) */
+    /* capture curl's stderr so failures can be explained */
     {
         char ebuf[4096];
+        size_t elen = 0;
         for (;;) {
             ssize_t n = read(errp[0], ebuf, sizeof ebuf);
             if (n <= 0) break;
+            for (ssize_t i = 0; i < n && elen < sizeof r->err - 1; i++)
+                r->err[elen++] = ebuf[i];
         }
+        r->err[elen] = 0;
     }
     close(outp[0]);
     close(errp[0]);
@@ -1468,7 +1474,10 @@ typedef struct {
 /* fetch the directory and remember the endpoint URLs */
 static void acme_init(Acme *a, const char *directory) {
     HttpResp r;
-    if (http_req(&r, directory, NULL, NULL, 0) < 0 || r.status != 200)
+    if (http_req(&r, directory, NULL, NULL, 0) < 0)
+        die("cannot fetch directory %s: curl failed%s%s",
+            directory, r.err[0] ? ": " : "", r.err);
+    if (r.status != 200)
         die("cannot fetch directory %s (status %d)", directory, r.status);
     json_error_t err;
     json_t *d = json_loads(r.body, 0, &err);
@@ -1487,10 +1496,11 @@ static void acme_init(Acme *a, const char *directory) {
 /* fetch a fresh replay nonce */
 static void acme_nonce(Acme *a, char nonce[128]) {
     HttpResp r;
-    if (http_req(&r, a->nonce_url, NULL, NULL, 1) < 0 || r.status < 200 ||
-        r.status >= 300) {
+    if (http_req(&r, a->nonce_url, NULL, NULL, 1) < 0)
+        die("cannot fetch nonce: curl failed%s%s",
+            r.err[0] ? ": " : "", r.err);
+    if (r.status < 200 || r.status >= 300)
         die("cannot fetch nonce (status %d)", r.status);
-    }
     const char *v = hdr_get(r.hdr, "Replay-Nonce");
     if (!v) die("no Replay-Nonce in response");
     snprintf(nonce, 128, "%s", v);
@@ -1562,7 +1572,8 @@ static char *jws_post(Acme *a, const char *url, const char *payload,
         HttpResp r;
         int ok = http_req(&r, url, bodystr, accept, 0) == 0;
         free(bodystr);
-        if (!ok) die("curl POST to %s failed", url);
+        if (!ok) die("curl POST to %s failed%s%s",
+                     url, r.err[0] ? ": " : "", r.err);
 
         if (r.status >= 400) {
             /* a badNonce may be retried with a fresh nonce */
@@ -1721,6 +1732,84 @@ static void acme_authorize(Acme *a, const char *authz_url,
             domain, status ? status : "?");
     }
     unlink(path);                                  /* challenge done */
+}
+
+/* true if the first certificate in the PEM file was issued by the
+ * Let's Encrypt staging CA (issuer CN/O contains "Fake LE" or
+ * "Staging") */
+static int cert_is_staging(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char buf[65536];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    if (n == 0 || n == sizeof buf - 1) return 0;
+    buf[n] = 0;
+
+    static const char BEG[] = "-----BEGIN CERTIFICATE-----";
+    static const char END[] = "-----END CERTIFICATE-----";
+    char *p = strstr((char *)buf, BEG);
+    if (!p) return 0;
+    p += sizeof BEG - 1;
+    char *e = strstr(p, END);
+    if (!e) return 0;
+    *e = 0;
+
+    unsigned char der[8192];
+    int dl = b64_decode(p, der, sizeof der);
+    if (dl <= 0) return 0;
+    const unsigned char *end = der + dl;
+
+    /* Certificate -> TBS content -> skip version/serial/sigalg */
+    const unsigned char *q = der_enter(der, end);
+    if (!q) return 0;
+    const unsigned char *c = der_enter(q, end);
+    if (!c) return 0;
+    if (c < end && *c == 0xa0) {
+        c = der_next(c, end);
+        if (!c) return 0;
+    }
+    c = der_next(c, end);                          /* serialNumber */
+    if (!c) return 0;
+    c = der_next(c, end);                          /* signature alg */
+    if (!c) return 0;
+
+    /* issuer Name at c: walk SET { SEQ { OID, value } } */
+    if (c >= end || *c != 0x30) return 0;
+    const unsigned char *is = der_enter(c, end);
+    const unsigned char *iend = der_next(c, end);
+    if (!is || !iend) return 0;
+
+    const unsigned char *r = is;
+    while (r < iend) {
+        if (*r != 0x31) {                          /* not a SET: skip */
+            r = der_next(r, iend);
+            if (!r) break;
+            continue;
+        }
+        const unsigned char *sq = der_enter(r, iend);
+        if (sq && *sq == 0x30) {
+            const unsigned char *sc = der_enter(sq, iend);
+            if (sc && sc[0] == 0x06 && sc[1] == 3 && sc[2] == 0x55 &&
+                sc[3] == 0x04 && (sc[4] == 0x03 || sc[4] == 0x0a)) {
+                /* OID 2.5.4.3 (CN) or 2.5.4.10 (O) */
+                const unsigned char *val = der_next(sc, iend);
+                if (val && val[1] < 0x80 &&
+                    (val[0] == 0x0c || val[0] == 0x13 || val[0] == 0x16)) {
+                    char lb[64];
+                    size_t vl = val[1];
+                    if (vl > sizeof lb - 1) vl = sizeof lb - 1;
+                    memcpy(lb, val + 2, vl);
+                    lb[vl] = 0;
+                    if (strcasestr(lb, "fake le") || strcasestr(lb, "staging"))
+                        return 1;
+                }
+            }
+        }
+        r = der_next(r, iend);
+        if (!r) break;
+    }
+    return 0;
 }
 
 /* =====================================================================
@@ -1925,6 +2014,8 @@ static void usage(FILE *out) {
         "                       acme_account_key from CONFIG, else\n"
         "                       acme-account.pem next to CONFIG)\n"
         "  --contact EMAIL      email to register with the ACME account\n"
+        "                       (only used on the first run, when the\n"
+        "                       account is created)\n"
         "  --staging            use the Let's Encrypt staging directory\n"
         "  --acme-url URL       ACME directory URL (default: the acme_url\n"
         "                       from CONFIG, else Let's Encrypt\n"
@@ -2112,10 +2203,19 @@ int main(int argc, char **argv) {
         if (renew_days > 0) {
             long left = cert_days_left(job->cert);
             if (left > renew_days) {
-                printf("%s: certificate still valid for %ld days, skipping\n",
-                       job->cert, left);
-                skipped++;
-                continue;
+                /* a staging-issued certificate is never kept when
+                 * talking to a non-staging directory (the usual
+                 * "drop --staging for production" flow) */
+                int staging_cert = cert_is_staging(job->cert);
+                int staging_run = strstr(acme_url, "staging") != NULL;
+                if (!(staging_cert && !staging_run)) {
+                    printf("%s: certificate still valid for %ld days, skipping\n",
+                           job->cert, left);
+                    skipped++;
+                    continue;
+                }
+                printf("%s: certificate was issued by the staging CA, "
+                       "renewing\n", job->cert);
             }
         }
 

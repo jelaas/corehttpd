@@ -334,8 +334,8 @@ Config *config_load(Arena *a, const char *path) {
         if (!file_exists(c->cert_file) || !file_exists(c->key_file)) {
             /* not there yet: start without a default certificate so the
              * HTTP-01 bootstrap (ACME challenges on port 80) works */
-            log_warn("config: %s/%s do not exist yet; starting without a "
-                     "default certificate",
+            log_warn("config: certificate files %s and %s do not exist "
+                     "yet; starting without a default certificate",
                      c->cert_file, c->key_file);
         } else {
             c->tls_key = key_load_cached(a, c->cert_file, c->key_file,
@@ -360,8 +360,8 @@ Config *config_load(Arena *a, const char *path) {
                 /* the site starts with the default certificate; once the
                  * files appear (e.g. after corehttpd-acme fetches them),
                  * restart the server */
-                log_warn("config: site %s: %s/%s do not exist yet; using "
-                         "the default certificate",
+                log_warn("config: site %s: certificate files %s and %s do "
+                         "not exist yet; using the default certificate",
                          sc->name ? sc->name : "?",
                          sc->cert_file, sc->key_file);
                 continue;
@@ -889,6 +889,23 @@ static void access_log_request(struct SrvCtx *ctx,
     send_fd_all(ctx->log_fd, line, (size_t)n);
 }
 
+/* wait for the next request on a keep-alive connection.  Returns 1 when
+ * request data is pending, 0 when the wait expired, -1 when a new
+ * connection is pending on a listening socket (single-threaded server:
+ * the idle keep-alive connection is dropped in favour of new work). */
+static int wait_keepalive(struct SrvCtx *ctx, Conn *c, int secs) {
+    if (c->tls && tls_pending(c->tls)) return 1;
+    struct pollfd p[3] = {
+        { c->fd, POLLIN, 0 },
+        { ctx->srv80, POLLIN, 0 },
+        { ctx->srv443, POLLIN, 0 },
+    };
+    int r = poll(p, 3, secs * 1000);
+    if (r <= 0) return r;                 /* 0 = timeout, -1 = error */
+    if (p[0].revents & (POLLIN | POLLHUP | POLLERR)) return 1;
+    return -1;                            /* new connection pending */
+}
+
 /* Main per‑connection handler. */
 static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
     struct sockaddr_in peer; socklen_t pl = sizeof(peer);
@@ -908,8 +925,17 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
         }
     }
 
+    int first = 1;
     for (;;) {
         arena_reset(ctx->arena);
+
+        if (!first) {
+            /* keep-alive: wait for the next request, but let new
+             * connections preempt the idle one */
+            if (wait_keepalive(ctx, &conn, ctx->cfg->def_header_timeout) <= 0)
+                break;
+        }
+        first = 0;
 
         uint64_t bytes0 = conn.nbytes;
         int status = 500;
