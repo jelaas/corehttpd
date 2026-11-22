@@ -87,6 +87,21 @@ static const char *j_str(json_t *o, const char *k) {
     return json_is_string(v) ? json_string_value(v) : NULL;
 }
 
+/* file mode: a string of octal digits ("0640") or a plain integer */
+static int j_mode(json_t *o, const char *k, int def) {
+    json_t *v = o ? json_object_get(o, k) : NULL;
+    if (json_is_string(v)) {
+        const char *s = json_string_value(v);
+        if (!s[0]) return def;
+        char *end = NULL;
+        long m = strtol(s, &end, 8);
+        if (!*end && m >= 0 && m <= 07777) return (int)m;
+        return def;
+    }
+    if (json_is_integer(v)) return (int)json_integer_value(v);
+    return def;
+}
+
 static Acl *parse_acl(Arena *a, json_t *arr, int *n_out) {
     *n_out = 0;
     if (!json_is_array(arr)) return NULL;
@@ -245,6 +260,9 @@ Config *config_load(Arena *a, const char *path) {
     c->cert_file        = arena_strdup(a, j_str(root, "cert_file"));
     c->key_file         = arena_strdup(a, j_str(root, "key_file"));
     c->letsencrypt_root = arena_strdup(a, j_str(root, "letsencrypt_root"));
+    c->access_log       = arena_strdup(a, j_str(root, "access_log"));
+    c->access_log_owner = arena_strdup(a, j_str(root, "access_log_owner"));
+    c->access_log_mode  = j_mode(root, "access_log_mode", -1);
     c->arena_size       = j_int(root, "arena_size", 32u << 20);
 
     json_t *defs = json_object_get(root, "defaults");
@@ -316,6 +334,7 @@ static int send_all(Conn *c, const void *buf, size_t n) {
     while (n) {
         ssize_t w = c->tls ? tls_write(c->tls, p, n) : write(c->fd, p, n);
         if (w < 0) { if (errno == EINTR) continue; return -1; }
+        c->nbytes += (uint64_t)w;
         p += w; n -= (size_t)w;
     }
     return 0;
@@ -331,6 +350,12 @@ static int send_fd_all(int fd, const void *buf, size_t n) {
     }
     return 0;
 }
+
+/* error logging (defined in the logging section below) */
+static void log_err(const char *fmt, ...);
+static void log_warn(const char *fmt, ...);
+static void log_info(const char *fmt, ...);
+static void log_debug(const char *fmt, ...);
 
 static int b64_val(int c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -540,6 +565,7 @@ struct SrvCtx {
     Arena   *arena;
     int      srv80, srv443;
     int      cgi_fd;
+    int      log_fd;             /* access-log lines go to the master */
     int      stop;
 };
 
@@ -627,54 +653,57 @@ static int serve_file(Conn *c, const char *root, const char *fullpath,
     return 0;
 }
 
-/* forward raw CGI output from cgi_fd to client */
+/* forward raw CGI output from cgi_fd to client; returns the status code */
 static int relay_cgi(Conn *c, int cgi_fd, int head_only) {
     char buf[65536];
     int in_body = 0;
+    int status = 200;
     size_t hdr_len = 0;
     char hdrbuf[8192];
     while (1) {
         ssize_t r = read(cgi_fd, buf, sizeof(buf));
         if (r <= 0) break;
-        if (head_only) {
-            if (!in_body) {
-                size_t csz = (size_t)r;
-                if (hdr_len + csz >= sizeof(hdrbuf)) csz = sizeof(hdrbuf) - hdr_len - 1;
-                memcpy(hdrbuf + hdr_len, buf, csz);
-                hdr_len += csz;
-                hdrbuf[hdr_len] = 0;
-                char *e = strstr(hdrbuf, "\r\n\r\n");
-                if (e) {
-                    size_t hlen = (size_t)(e - hdrbuf) + 4;
-                    (void)hlen;
-                    char status[256] = "200 OK";
-                    char *line = hdrbuf;
-                    while (line < e) {
-                        char *nl = strstr(line, "\r\n");
-                        if (!nl) break;
-                        if (!strncasecmp(line, "Status:", 7)) {
-                            size_t l = (size_t)(nl - line - 7);
-                            if (l > sizeof(status) - 1) l = sizeof(status) - 1;
-                            memcpy(status, line + 8 < nl ? line + 8 : line + 7, l);
-                            status[l] = 0;
-                            char *s = trim(status); memmove(status, s, strlen(s) + 1);
+        if (!in_body) {
+            size_t csz = (size_t)r;
+            if (hdr_len + csz >= sizeof(hdrbuf)) csz = sizeof(hdrbuf) - hdr_len - 1;
+            memcpy(hdrbuf + hdr_len, buf, csz);
+            hdr_len += csz;
+            hdrbuf[hdr_len] = 0;
+            char *e = strstr(hdrbuf, "\r\n\r\n");
+            if (e) {
+                /* honour a "Status:" header from the CGI program */
+                char *line = hdrbuf;
+                while (line < e) {
+                    char *nl = strstr(line, "\r\n");
+                    if (!nl) break;
+                    if (!strncasecmp(line, "Status:", 7)) {
+                        char st[256] = "200 OK";
+                        size_t l = (size_t)(nl - line - 7);
+                        if (l > sizeof(st) - 1) l = sizeof(st) - 1;
+                        memcpy(st, line + 8 < nl ? line + 8 : line + 7, l);
+                        st[l] = 0;
+                        char *s = trim(st);
+                        status = atoi(s);
+                        if (head_only) {
+                            char h[1024];
+                            int hn = snprintf(h, sizeof(h),
+                                "HTTP/1.1 %s\r\nServer: corehttpd\r\n"
+                                "Connection: keep-alive\r\n\r\n", s);
+                            if (hn < 0 || (size_t)hn >= sizeof(h)) return 502;
+                            send_all(c, h, (size_t)hn);
                         }
-                        line = nl + 2;
+                        break;
                     }
-                    char h[1024];
-                    int hn = snprintf(h, sizeof(h),
-                        "HTTP/1.1 %s\r\nServer: corehttpd\r\n"
-                        "Connection: keep-alive\r\n\r\n", status);
-                    if (hn < 0 || (size_t)hn >= sizeof(h)) return -1;
-                    send_all(c, h, (size_t)hn);
-                    in_body = 1;
+                    line = nl + 2;
                 }
+                in_body = 1;
             }
-        } else {
+        }
+        if (!head_only) {
             if (send_all(c, buf, (size_t)r) < 0) break;
         }
     }
-    return 0;
+    return status;
 }
 
 /* Match the request's remaining relative path against the effective dir's
@@ -717,29 +746,80 @@ static char *arena_sprintf(Arena *a, const char *fmt, ...) {
     return p;
 }
 
+/* Build one Apache-style access-log line and ship it to the master
+ * (which writes it to disk). */
+static void access_log_request(struct SrvCtx *ctx,
+                               const struct sockaddr_in *peer,
+                               const HttpRequest *req,
+                               const char *auth_user,
+                               int status, uint64_t nbytes) {
+    if (ctx->log_fd < 0) return;
+    char ip[INET_ADDRSTRLEN] = "-";
+    inet_ntop(AF_INET, &peer->sin_addr, ip, sizeof ip);
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    char ts[64];
+    strftime(ts, sizeof ts, "%d/%b/%Y:%H:%M:%S %z", &tm);
+    char line[2048];
+    int n = snprintf(line, sizeof line,
+        "%s - %s [%s] \"%s %s%s%s %s\" %d %llu\n",
+        ip,
+        auth_user ? auth_user : "-",
+        ts,
+        req->method ? req->method : "-",
+        req->path ? req->path : "-",
+        req->query && *req->query ? "?" : "",
+        req->query ? req->query : "",
+        req->version ? req->version : "-",
+        status, (unsigned long long)nbytes);
+    if (n < 0) return;
+    if (n >= (int)sizeof line) n = (int)sizeof line - 1;
+    send_fd_all(ctx->log_fd, line, (size_t)n);
+}
+
 /* Main per‑connection handler. */
 static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
     struct sockaddr_in peer; socklen_t pl = sizeof(peer);
     getpeername(fd, (struct sockaddr *)&peer, &pl);
+    char ip[INET_ADDRSTRLEN] = "-";
+    inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
 
-    Conn conn = { fd, NULL };
+    Conn conn = { fd, NULL, 0 };
     if (is_tls) {
         conn.tls = tls_server_handshake(ctx->arena, fd, ctx->cfg->tls_key,
                                         ctx->cfg->def_header_timeout);
-        if (!conn.tls) { close(fd); return; }
+        if (!conn.tls) {
+            log_warn("TLS handshake failed (client %s)", ip);
+            close(fd);
+            return;
+        }
     }
 
     for (;;) {
         arena_reset(ctx->arena);
 
+        uint64_t bytes0 = conn.nbytes;
+        int status = 500;
+        const char *auth_user = NULL;
+
         HttpRequest req;
         int r = http_read_request(ctx->arena, &conn, &req,
                                   ctx->cfg->def_header_timeout,
                                   ctx->cfg->def_body_timeout);
-        if (r < 0) break;
+        if (r < 0) {
+            log_debug("client %s: request read failed or timed out", ip);
+            break;
+        }
 
         SiteCfg *site = config_find_site(ctx->cfg, req.host);
-        if (!site) { http_send_simple(&conn, 404, "Not Found", NULL, "no site", 7, 0); break; }
+        if (!site) {
+            status = 404;
+            http_send_simple(&conn, 404, "Not Found", NULL, "no site", 7, 0);
+            access_log_request(ctx, &peer, &req, NULL, status,
+                               conn.nbytes - bytes0);
+            break;
+        }
 
         /* mutate a scratch copy of the path for walking */
         char *path_scratch = arena_strdup(ctx->arena, req.path);
@@ -751,8 +831,11 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
         /* ---- port 80: redirect / letsencrypt / GET-HEAD only ---- */
         if (!is_tls) {
             if (strcmp(req.method, "GET") && strcmp(req.method, "HEAD")) {
+                status = 405;
                 http_send_simple(&conn, 405, "Method Not Allowed",
                                  "Allow: GET, HEAD\r\n", "no\r\n", 4, head_only);
+                access_log_request(ctx, &peer, &req, NULL, status,
+                                   conn.nbytes - bytes0);
                 if (!req.keep_alive) break;
 		continue;
             }
@@ -762,31 +845,45 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
                                     ? ctx->cfg->letsencrypt_root
                                     : "/var/www/letsencrypt";
                 snprintf(full, sizeof(full), "%s/%s", le_root, req.path + 28);
-                if (serve_file(&conn, le_root, full, head_only) < 0)
+                if (serve_file(&conn, le_root, full, head_only) < 0) {
+                    status = 404;
                     http_send_simple(&conn, 404, "Not Found", NULL, "not found\n", 10, head_only);
+                } else {
+                    status = 200;
+                }
             } else {
+                status = 301;
                 char loc[1024];
                 snprintf(loc, sizeof(loc), "Location: https://%s%s\r\n",
                          req.host ? req.host : site->name, req.path);
                 http_send_simple(&conn, 301, "Moved Permanently", loc, "", 0, head_only);
             }
+            access_log_request(ctx, &peer, &req, NULL, status,
+                               conn.nbytes - bytes0);
             if (!req.keep_alive) break;
             continue;
         }
 
         /* ---- restrictions ---- */
         if (!ip_allowed(eff, &peer)) {
+            status = 403;
             http_send_simple(&conn, 403, "Forbidden", NULL, "forbidden\n", 10, head_only);
+            access_log_request(ctx, &peer, &req, NULL, status,
+                               conn.nbytes - bytes0);
             if (!req.keep_alive) break;
 	    continue;
         }
         if (!auth_check(eff, req.authorization)) {
+            status = 401;
             http_send_simple(&conn, 401, "Unauthorized",
                 "WWW-Authenticate: Basic realm=\"corehttpd\"\r\n",
                 "auth required\n", 14, head_only);
+            access_log_request(ctx, &peer, &req, NULL, status,
+                               conn.nbytes - bytes0);
             if (!req.keep_alive) break;
 	    continue;
         }
+        if (eff->auth_required) auth_user = eff->auth_user;
 
         /* ---- CGI dispatch (per-dir) ---- */
         {
@@ -852,11 +949,16 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
                 env[ne] = NULL;
 
                 if (cgi_dispatch(ctx->arena, ctx->cgi_fd, prog_path, user,
-                                 env, ne, req.body, req.body_len) < 0)
+                                 env, ne, req.body, req.body_len) < 0) {
+                    status = 502;
+                    log_warn("client %s: cgi dispatch failed for %s",
+                             ip, prog_path);
                     http_send_simple(&conn, 502, "Bad Gateway", NULL, "cgi\n", 4, head_only);
-                else
-                    relay_cgi(&conn, ctx->cgi_fd, head_only);
-
+                } else {
+                    status = relay_cgi(&conn, ctx->cgi_fd, head_only);
+                }
+                access_log_request(ctx, &peer, &req, auth_user, status,
+                                   conn.nbytes - bytes0);
                 if (!req.keep_alive) break;
                 continue;
             }
@@ -866,7 +968,10 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
         char full[2048];
         int fl = snprintf(full, sizeof(full), "%s/%s", eff->path, rest);
         if (fl < 0 || (size_t)fl >= sizeof(full)) {
+            status = 414;
             http_send_simple(&conn, 414, "URI Too Long", NULL, "uri too long\n", 13, head_only);
+            access_log_request(ctx, &peer, &req, auth_user, status,
+                               conn.nbytes - bytes0);
             if (!req.keep_alive) break;
             continue;
         }
@@ -875,22 +980,38 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
             size_t flen = strlen(full);
             static const char suffix[] = "/index.html";   /* 11 + NUL */
             if (flen + sizeof(suffix) > sizeof(full)) {
+                status = 414;
                 http_send_simple(&conn, 414, "URI Too Long", NULL, "uri too long\n", 13, head_only);
+                access_log_request(ctx, &peer, &req, auth_user, status,
+                                   conn.nbytes - bytes0);
                 if (!req.keep_alive) break;
                 continue;
             }
             memcpy(full + flen, suffix, sizeof(suffix));
-            if (serve_file(&conn, eff->path, full, head_only) < 0)
+            if (serve_file(&conn, eff->path, full, head_only) < 0) {
+                status = 403;
                 http_send_simple(&conn, 403, "Forbidden", NULL, "forbidden\n", 10, head_only);
+            } else {
+                status = 200;
+            }
         } else {
-            if (serve_file(&conn, eff->path, full, head_only) < 0)
+            if (serve_file(&conn, eff->path, full, head_only) < 0) {
+                status = 404;
                 http_send_simple(&conn, 404, "Not Found", NULL, "not found\n", 10, head_only);
+            } else {
+                status = 200;
+            }
         }
+        access_log_request(ctx, &peer, &req, auth_user, status,
+                           conn.nbytes - bytes0);
         if (!req.keep_alive) break;
         continue;
 
 cgi_nomem:
+        status = 500;
         http_send_simple(&conn, 500, "Internal Server Error", NULL, "nomem\n", 6, head_only);
+        access_log_request(ctx, &peer, &req, auth_user, status,
+                           conn.nbytes - bytes0);
         if (!req.keep_alive) break;
         continue;
     }
@@ -979,18 +1100,31 @@ static int cgi_run_one(int cgi_fd) {
     if (pid < 0) goto fail;
     if (pid == 0) {
         struct passwd *pw = getpwnam(user);
-        if (!pw) _exit(126);
+        if (!pw) {
+            log_err("cgi: unknown user '%s' for %s", user, prog);
+            _exit(126);
+        }
         setgroups(0, NULL);
-        if (setgid(pw->pw_gid) < 0) _exit(126);
-        if (setuid(pw->pw_uid) < 0) _exit(126);
+        if (setgid(pw->pw_gid) < 0) {
+            log_err("cgi: setgid(%s) for %s: %s", user, prog, strerror(errno));
+            _exit(126);
+        }
+        if (setuid(pw->pw_uid) < 0) {
+            log_err("cgi: setuid(%s) for %s: %s", user, prog, strerror(errno));
+            _exit(126);
+        }
 
         int inp[2], outp[2];
-        if (pipe(inp) < 0 || pipe(outp) < 0) _exit(126);
+        if (pipe(inp) < 0 || pipe(outp) < 0) {
+            log_err("cgi: pipe for %s: %s", prog, strerror(errno));
+            _exit(126);
+        }
         pid_t p2 = fork();
         if (p2 == 0) {
             dup2(inp[0], 0); dup2(outp[1], 1);
             close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]);
             execve(prog, (char *const[]){ (char *)prog, NULL }, env);
+            log_err("cgi: execve %s: %s", prog, strerror(errno));
             _exit(127);
         }
         close(inp[0]); close(outp[1]);
@@ -1043,10 +1177,265 @@ static int open_port(int port) {
 
 static void drop_to(const char *user) {
     struct passwd *pw = getpwnam(user);
-    if (!pw) { fprintf(stderr, "unknown user %s\n", user); exit(1); }
-    if (setgroups(0, NULL) < 0) { perror("setgroups"); exit(1); }
-    if (setgid(pw->pw_gid) < 0) { perror("setgid"); exit(1); }
-    if (setuid(pw->pw_uid) < 0) { perror("setuid"); exit(1); }
+    if (!pw) { log_err("unknown user %s", user); fprintf(stderr, "unknown user %s\n", user); exit(1); }
+    if (setgroups(0, NULL) < 0) { log_err("setgroups: %s", strerror(errno)); perror("setgroups"); exit(1); }
+    if (setgid(pw->pw_gid) < 0) { log_err("setgid: %s", strerror(errno)); perror("setgid"); exit(1); }
+    if (setuid(pw->pw_uid) < 0) { log_err("setuid: %s", strerror(errno)); perror("setuid"); exit(1); }
+}
+
+/* =====================================================================
+ * logging
+ * ===================================================================== */
+/* Error log: the master opens the file and the fd is inherited by the
+ * httpd and cgi children, so every process can log.  When no file is
+ * configured, messages go to stdout (which is what systemd collects);
+ * with a file configured they are additionally mirrored to stdout in
+ * the foreground. */
+static int g_errfd = -1;
+static int g_errlevel = 1;     /* 0 debug, 1 info, 2 warning, 3 error */
+static int g_mirror = 1;       /* also write to stdout; off after daemonize */
+
+static const char *err_level_name(int severity) {
+    switch (severity) {
+    case 0: return "debug";
+    case 1: return "info";
+    case 2: return "warning";
+    default: return "error";
+    }
+}
+
+static void log_msg(int severity, const char *msg) {
+    if (severity < g_errlevel) return;
+    char line[2048];
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    char ts[64];
+    strftime(ts, sizeof ts, "%a %b %d %H:%M:%S %Y", &tm);
+    int n = snprintf(line, sizeof line, "[%s] [%s] %s\n",
+                     ts, err_level_name(severity), msg);
+    if (n < 0) return;
+    if (n >= (int)sizeof line) n = (int)sizeof line - 1;
+    if (g_errfd >= 0) {
+        ssize_t w = write(g_errfd, line, (size_t)n);
+        (void)w;
+        if (g_mirror) {
+            w = write(1, line, (size_t)n);
+            (void)w;
+        }
+    } else {
+        ssize_t w = write(1, line, (size_t)n);
+        (void)w;
+    }
+}
+
+static void log_err(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    log_msg(3, buf);
+}
+
+static void log_warn(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    log_msg(2, buf);
+}
+
+static void log_info(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    log_msg(1, buf);
+}
+
+static void log_debug(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    log_msg(0, buf);
+}
+
+/* parse "user", "user:group", "uid", "uid:gid"; -1 entries mean "leave" */
+static int owner_ids(const char *spec, uid_t *uid, gid_t *gid) {
+    char buf[128];
+    if (!spec || !*spec) { *uid = (uid_t)-1; *gid = (gid_t)-1; return 0; }
+    snprintf(buf, sizeof buf, "%s", spec);
+    char *colon = strchr(buf, ':');
+    char *uname = buf, *gname = NULL;
+    if (colon) { *colon = 0; gname = colon + 1; }
+    if (uname[0] >= '0' && uname[0] <= '9') {
+        *uid = (uid_t)strtoul(uname, NULL, 10);
+    } else {
+        struct passwd *pw = getpwnam(uname);
+        if (!pw) return -1;
+        *uid = pw->pw_uid;
+    }
+    if (gname) {
+        if (gname[0] >= '0' && gname[0] <= '9') {
+            *gid = (gid_t)strtoul(gname, NULL, 10);
+        } else {
+            struct group *gr = getgrnam(gname);
+            if (!gr) return -1;
+            *gid = gr->gr_gid;
+        }
+    } else {
+        *gid = (gid_t)-1;
+    }
+    return 0;
+}
+
+/* Load the separate error-log config file (jsonc):
+ *   { "file": "...", "owner": "user[:group]", "mode": "0640",
+ *     "level": "debug"|"info"|"warning"|"error" }
+ * Missing or broken config falls back to stdout-only logging (silently
+ * so for the default path; with a note when explicitly requested). */
+static void errorlog_init(Arena *a, const char *path, int explicit_flag) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        if (explicit_flag || errno != ENOENT)
+            fprintf(stderr, "corehttpd: error-log config %s: %s (logging to stdout)\n",
+                    path, strerror(errno));
+        return;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0 || sz > 65536) {
+        fclose(f);
+        fprintf(stderr, "corehttpd: error-log config %s too large\n", path);
+        return;
+    }
+    char *raw = arena_alloc(a, (size_t)sz + 1);
+    if (!raw) { fclose(f); return; }
+    if (fread(raw, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); return; }
+    raw[sz] = 0;
+    fclose(f);
+
+    char *js = strip_jsonc(a, raw);
+    json_error_t err;
+    json_t *root = json_loads(js, 0, &err);
+    if (!root) {
+        fprintf(stderr, "corehttpd: error-log config %s: %s\n", path, err.text);
+        return;
+    }
+
+    const char *level = j_str(root, "level");
+    if (level) {
+        if (!strcmp(level, "debug")) g_errlevel = 0;
+        else if (!strcmp(level, "info")) g_errlevel = 1;
+        else if (!strcmp(level, "warning")) g_errlevel = 2;
+        else if (!strcmp(level, "error")) g_errlevel = 3;
+    }
+
+    const char *file = j_str(root, "file");
+    if (file) {
+        int mode = j_mode(root, "mode", 0640);
+        int fd = open(file, O_WRONLY | O_CREAT | O_APPEND, mode);
+        if (fd < 0) {
+            fprintf(stderr, "corehttpd: error log %s: %s\n", file, strerror(errno));
+        } else {
+            (void)fchmod(fd, (mode_t)mode);
+            const char *owner = j_str(root, "owner");
+            if (owner) {
+                uid_t uid; gid_t gid;
+                if (owner_ids(owner, &uid, &gid) == 0) {
+                    if (fchown(fd, uid, gid) < 0)
+                        fprintf(stderr, "corehttpd: fchown error log: %s\n",
+                                strerror(errno));
+                } else {
+                    fprintf(stderr, "corehttpd: error log owner '%s': unknown user/group\n",
+                            owner);
+                }
+            }
+            g_errfd = fd;
+        }
+    }
+    json_decref(root);
+}
+
+/* Open the access log with the configured ownership/mode.  Written only
+ * by the master; O_APPEND keeps lines from several instances intact. */
+static int accesslog_open(const Config *cfg) {
+    if (!cfg->access_log || !*cfg->access_log) return -1;
+    int mode = cfg->access_log_mode >= 0 ? cfg->access_log_mode : 0640;
+    int fd = open(cfg->access_log, O_WRONLY | O_CREAT | O_APPEND, mode);
+    if (fd < 0) {
+        log_err("access log %s: %s", cfg->access_log, strerror(errno));
+        return -1;
+    }
+    if (cfg->access_log_mode >= 0) (void)fchmod(fd, (mode_t)mode);
+    if (cfg->access_log_owner && *cfg->access_log_owner) {
+        uid_t uid; gid_t gid;
+        if (owner_ids(cfg->access_log_owner, &uid, &gid) == 0) {
+            if (fchown(fd, uid, gid) < 0)
+                log_warn("access log fchown: %s", strerror(errno));
+        } else {
+            log_err("access log owner '%s': unknown user/group",
+                    cfg->access_log_owner);
+        }
+    }
+    return fd;
+}
+
+/* classic double-fork daemonization */
+static void daemonize(void) {
+    pid_t pid = fork();
+    if (pid < 0) { log_err("fork: %s", strerror(errno)); exit(1); }
+    if (pid > 0) _exit(0);
+    if (setsid() < 0) { log_err("setsid: %s", strerror(errno)); exit(1); }
+    pid = fork();
+    if (pid < 0) { log_err("fork: %s", strerror(errno)); exit(1); }
+    if (pid > 0) _exit(0);
+    if (chdir("/") < 0) log_warn("chdir(/): %s", strerror(errno));
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+        int out = g_errfd >= 0 ? g_errfd : devnull;
+        (void)dup2(devnull, 0);
+        (void)dup2(out, 1);
+        (void)dup2(out, 2);
+        if (devnull > 2) close(devnull);
+    }
+    g_mirror = 0;              /* stderr now points at the error log */
+}
+
+/* Read access-log lines from the socket and write them to outfd.
+ * Lines arrive whole (one send per line); O_APPEND keeps them intact. */
+static void drain_log_lines(int sockfd, int outfd) {
+    static char acc[8192];
+    static size_t acclen = 0;
+    char buf[4096];
+    for (;;) {
+        ssize_t r = read(sockfd, buf, sizeof buf);
+        if (r <= 0) return;
+        for (ssize_t i = 0; i < r; i++) {
+            if (acclen < sizeof acc - 1) acc[acclen++] = buf[i];
+            if (buf[i] == '\n' || acclen == sizeof acc - 1) {
+                ssize_t w = write(outfd, acc, acclen);
+                (void)w;
+                acclen = 0;
+            }
+        }
+    }
+}
+
+static int g_sigpipe_w = -1;
+static void on_sig(int sig) {
+    int e = errno;
+    if (g_sigpipe_w >= 0) {
+        ssize_t r = write(g_sigpipe_w, &sig, sizeof sig);
+        (void)r;
+    }
+    errno = e;
 }
 
 static void usage(FILE *out) {
@@ -1061,6 +1450,11 @@ static void usage(FILE *out) {
         "\n"
         "Options:\n"
         "  -h, --help          show this help and exit\n"
+        "  -d, --daemonize     run in the background (for systems without\n"
+        "                      a service manager such as systemd)\n"
+        "  -e, --error-log-config PATH\n"
+        "                      separate JSONC file configuring the error\n"
+        "                      log (default: /etc/corehttpd/errorlog.jsonc)\n"
         "\n"
         "corehttpd must be started as root: it binds ports 80 and 443 and\n"
         "then drops privileges to the user configured as httpd_user.  The\n"
@@ -1074,25 +1468,39 @@ static void usage(FILE *out) {
         "\n"
         "Examples:\n"
         "  corehttpd\n"
-        "  corehttpd /etc/corehttpd/config.jsonc\n"
+        "  corehttpd --daemonize /etc/corehttpd/config.jsonc\n"
         "\n"
-        "See the README for the configuration file format.\n");
+        "See the README for the configuration file formats.\n");
 }
 
 int main(int argc, char **argv) {
     const char *cfgpath = "/etc/corehttpd/config.jsonc";
+    const char *errcfg = "/etc/corehttpd/errorlog.jsonc";
+    int daemon = 0;
+    int errcfg_explicit = 0;
 
-    if (argc > 1) {
-        if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(stdout);
             return 0;
-        }
-        if (argv[1][0] == '-') {
-            fprintf(stderr, "corehttpd: unknown option: %s\n", argv[1]);
+        } else if (!strcmp(argv[i], "-d") || !strcmp(argv[i], "--daemonize")) {
+            daemon = 1;
+        } else if (!strcmp(argv[i], "-e") ||
+                   !strcmp(argv[i], "--error-log-config")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "corehttpd: option %s needs an argument\n", argv[i]);
+                usage(stderr);
+                return 1;
+            }
+            errcfg = argv[++i];
+            errcfg_explicit = 1;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "corehttpd: unknown option: %s\n", argv[i]);
             usage(stderr);
             return 1;
+        } else {
+            cfgpath = argv[i];
         }
-        cfgpath = argv[1];
     }
 
     /* EPIPE instead of SIGPIPE death when a client goes away mid-write */
@@ -1100,35 +1508,83 @@ int main(int argc, char **argv) {
 
     Arena master_arena;
     arena_init(&master_arena, 10u << 20);
+
+    errorlog_init(&master_arena, errcfg, errcfg_explicit);
+    log_info("corehttpd starting, config %s", cfgpath);
+
     Config *cfg = config_load(&master_arena, cfgpath);
-    if (!cfg) { fprintf(stderr, "config load failed\n"); return 1; }
+    if (!cfg) { log_err("config load failed"); return 1; }
 
     /* the master reads the TLS material once and passes it to the
      * httpd child; the unprivileged child never touches the files */
     if (cfg->cert_file || cfg->key_file) {
         if (!cfg->cert_file || !cfg->key_file) {
-            fprintf(stderr, "config: need both cert_file and key_file\n");
+            log_err("config: need both cert_file and key_file");
             return 1;
         }
         cfg->tls_key = tls_load_key(&master_arena,
                                     cfg->cert_file, cfg->key_file);
         if (!cfg->tls_key) {
-            fprintf(stderr, "config: failed to load TLS key\n");
+            log_err("config: failed to load TLS key");
             return 1;
         }
     }
 
+    int access_fd = accesslog_open(cfg);
+    if (access_fd < 0 && !daemon) {
+        /* no access-log file (or it could not be opened): in the
+         * foreground, write access-log lines to stdout so systemd (or a
+         * terminal) collects them; daemonized stdout is /dev/null */
+        access_fd = 1;
+    }
+
+    if (daemon) daemonize();
+
     int srv80  = open_port(80);
     int srv443 = open_port(443);
+    log_info("listening on ports 80 and 443");
+
+    /* httpd -> master channel carrying access-log lines */
+    int log_pair[2] = { -1, -1 };
+    if (access_fd >= 0 &&
+        socketpair(AF_UNIX, SOCK_STREAM, 0, log_pair) < 0) {
+        log_err("socketpair (access log): %s", strerror(errno));
+        return 1;
+    }
 
     int cgi_pair[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, cgi_pair) < 0) { perror("socketpair"); return 1; }
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, cgi_pair) < 0) {
+        log_err("socketpair (cgi): %s", strerror(errno));
+        return 1;
+    }
+
+    /* self-pipe so signals wake the master out of poll() */
+    int sigpipe[2];
+    if (pipe(sigpipe) < 0) { log_err("pipe: %s", strerror(errno)); return 1; }
+    g_sigpipe_w = sigpipe[1];
+    {
+        int fl = fcntl(sigpipe[0], F_GETFL, 0);
+        if (fl >= 0) fcntl(sigpipe[0], F_SETFL, fl | O_NONBLOCK);
+    }
+    if (log_pair[0] >= 0) {
+        int fl = fcntl(log_pair[0], F_GETFL, 0);
+        if (fl >= 0) fcntl(log_pair[0], F_SETFL, fl | O_NONBLOCK);
+    }
+    struct sigaction sa = {0};
+    sa.sa_handler = on_sig;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
 
     /* cgi child */
     pid_t cgi_pid = fork();
     if (cgi_pid == 0) {
         close(srv80); close(srv443);
         close(cgi_pair[0]);
+        if (log_pair[0] >= 0) close(log_pair[0]);
+        if (log_pair[1] >= 0) close(log_pair[1]);
+        close(sigpipe[0]); close(sigpipe[1]);
+        if (access_fd > 2) close(access_fd);
         /* cgi broker runs privileged so it can setuid per program */
         run_cgi(cgi_pair[1]);
         _exit(0);
@@ -1139,34 +1595,80 @@ int main(int argc, char **argv) {
     pid_t httpd_pid = fork();
     if (httpd_pid == 0) {
         drop_to(cfg->httpd_user);
+        if (log_pair[0] >= 0) close(log_pair[0]);
+        close(sigpipe[0]); close(sigpipe[1]);
+        if (access_fd > 2) close(access_fd);
         Arena *ar = mmap(NULL, sizeof(Arena), PROT_READ | PROT_WRITE,
                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
         arena_init(ar, cfg->arena_size);
         struct SrvCtx ctx = {
             .cfg = cfg, .arena = ar,
             .srv80 = srv80, .srv443 = srv443,
-            .cgi_fd = cgi_pair[0], .stop = 0,
+            .cgi_fd = cgi_pair[0], .log_fd = log_pair[1], .stop = 0,
         };
         run_httpd(&ctx);
         _exit(0);
     }
     close(cgi_pair[0]);
+    if (log_pair[1] >= 0) close(log_pair[1]);
+    /* note: sigpipe[1] stays open in the master — the signal handler
+     * writes to it to wake the poll loop */
+    log_info("master running (httpd pid %d, cgi pid %d)",
+             (int)httpd_pid, (int)cgi_pid);
 
-    /* master waits; on SIGTERM forwards to httpd, then kills cgi */
-    sigset_t set; sigemptyset(&set); sigaddset(&set, SIGTERM); sigaddset(&set, SIGINT);
-    sigprocmask(SIG_BLOCK, &set, NULL);
+    /* master: write access-log lines to disk, react to signals */
+    int stopping = 0;
+    for (;;) {
+        struct pollfd pfd[2];
+        nfds_t nfds = 0;
+        pfd[nfds].fd = sigpipe[0]; pfd[nfds].events = POLLIN; nfds++;
+        if (log_pair[0] >= 0) {
+            pfd[nfds].fd = log_pair[0];
+            pfd[nfds].events = POLLIN;
+            nfds++;
+        }
 
-    int stop = 0;
-    while (!stop) {
-        int sig;
-        sigwait(&set, &sig);
-        if (sig == SIGTERM || sig == SIGINT) stop = 1;
+        int pr = poll(pfd, nfds, 1000);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            log_err("poll: %s", strerror(errno));
+            break;
+        }
+
+        if (pfd[0].revents & POLLIN) {
+            int sig = 0;
+            while (read(sigpipe[0], &sig, sizeof sig) == (ssize_t)sizeof sig) {}
+            if (!stopping) {
+                stopping = 1;
+                log_info("received signal %d, shutting down", sig);
+                kill(httpd_pid, SIGTERM);
+            }
+        }
+
+        if (nfds > 1 && (pfd[1].revents & POLLIN))
+            drain_log_lines(log_pair[0], access_fd);
+        if (nfds > 1 && (pfd[1].revents & (POLLHUP | POLLERR))) {
+            if (!stopping) {
+                stopping = 1;
+                log_warn("httpd exited unexpectedly");
+                kill(httpd_pid, SIGTERM);
+            }
+        }
+
+        if (stopping) {
+            int st;
+            if (waitpid(httpd_pid, &st, WNOHANG) == httpd_pid) {
+                if (log_pair[0] >= 0)
+                    drain_log_lines(log_pair[0], access_fd);
+                break;
+            }
+        }
     }
-    kill(httpd_pid, SIGTERM);
-    int status;
-    waitpid(httpd_pid, &status, 0);
+
     kill(cgi_pid, SIGTERM);
-    waitpid(cgi_pid, &status, 0);
+    waitpid(cgi_pid, NULL, 0);
     close(srv80); close(srv443);
+    if (access_fd > 2) close(access_fd);
+    log_info("shutdown complete");
     return 0;
 }

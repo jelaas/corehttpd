@@ -24,6 +24,11 @@ Features:
   Let's Encrypt ACME challenges
 - Path-traversal protection (`./` and `../` are rejected and file paths are
   verified to stay inside the document root)
+- Apache-style access log written by the master process (configurable
+  name, owner, mode); safe to share one log file between instances
+- Error log (configurable in a separate JSONC file) used by all
+  processes: startup/shutdown, request problems, CGI failures
+- `--daemonize` flag for systems without a service manager
 - All request memory comes from a single arena that is reset after each
   request
 
@@ -45,19 +50,27 @@ This produces a static binary `./corehttpd`.
 corehttpd must be started as root, because it binds ports 80 and 443:
 
 ```sh
-./corehttpd [/path/to/config.jsonc]
+./corehttpd [OPTIONS] [/path/to/config.jsonc]
 ```
 
 If no path is given, `/etc/corehttpd/config.jsonc` is used. Running
 `corehttpd -h` (or `--help`) prints a short usage summary.
 
+Options:
+
+| Option                      | Meaning                                            |
+|-----------------------------|----------------------------------------------------|
+| `-d`, `--daemonize`         | run in the background (double fork, `setsid`, redirect stdio) |
+| `-e`, `--error-log-config P`| error-log config file (default: `/etc/corehttpd/errorlog.jsonc`) |
+
 The server consists of three processes:
 
 1. **master** — runs as root. Reads the configuration, reads the TLS
    certificate and private key *once*, opens ports 80 and 443, and forks
-   the other processes. On `SIGTERM`/`SIGINT` it forwards the signal to the
-   httpd process, waits for the in-flight request to finish, then terminates
-   the CGI broker and exits.
+   the other processes. It writes all access-log lines to disk (the httpd
+   process sends them to it over a socket pair). On `SIGTERM`/`SIGINT` it
+   forwards the signal to the httpd process, waits for the in-flight
+   request to finish, then terminates the CGI broker and exits.
 2. **httpd** — handles all HTTP/HTTPS requests. Drops privileges to the
    configured `httpd_user`. Does not fork per request.
 3. **cgi broker** — started privileged (root) so it can switch to the
@@ -67,6 +80,24 @@ The server consists of three processes:
 The listening sockets use `SO_REUSEPORT`, so an administrator can start
 several instances on the same ports to scale across processes (each
 connection is served synchronously within one process).
+
+### Without systemd (SysV init and friends)
+
+Use the daemonize flag from an init script or `rc.local`:
+
+```sh
+/usr/local/sbin/corehttpd --daemonize /etc/corehttpd/config.jsonc
+```
+
+The process double-forks into the background; the starting process
+exits with status 0 once the master is up (config, TLS key and log
+files are loaded and validated *before* detaching, so configuration
+errors are still visible on the terminal). `SIGTERM` stops it.
+
+Note: with `--daemonize` the process changes its working directory to
+`/`, so use **absolute paths** in the configuration (cert/key files,
+document roots, log files). Without `--daemonize` the server stays in
+the foreground — which is what you want under systemd.
 
 ### systemd example
 
@@ -100,6 +131,11 @@ systemctl enable --now corehttpd@{1,2,3,4}
 The number of instances is a scaling knob; any of them can be stopped or
 started at any time without disturbing the others.
 
+Under systemd you can skip the log-file configuration entirely: without
+an `access_log` and an error-log file, both logs go to stdout in the
+foreground, and systemd forwards stdout to the journal
+(`journalctl -u corehttpd@1`).
+
 ## Configuration
 
 The configuration file is **JSONC** — JSON with C-style comments
@@ -119,6 +155,12 @@ The configuration file is **JSONC** — JSON with C-style comments
   // Directory served for Let's Encrypt ACME challenges on port 80
   // (default: /var/www/letsencrypt).
   "letsencrypt_root": "/var/www/letsencrypt",
+
+  // Access log (optional).  Written by the master process in the
+  // Apache "common" format.  If omitted, no access log is written.
+  "access_log": "/var/log/corehttpd/access.log",
+  "access_log_owner": "root:adm",   // "user" or "user:group" (default: root)
+  "access_log_mode": "0640",        // octal string (default: 0640)
 
   // Size of the per-connection request arena (default: 32 MB).
   "arena_size": 33554432,
@@ -188,6 +230,9 @@ The configuration file is **JSONC** — JSON with C-style comments
 | `cert_file`        | PEM certificate chain (or single DER)              | —                     |
 | `key_file`         | PEM/DER EC private key (P-256, SEC1 or PKCS#8)     | —                     |
 | `letsencrypt_root` | where ACME challenge files are read from           | `/var/www/letsencrypt`|
+| `access_log`       | access log file (absent = no access log)           | —                     |
+| `access_log_owner` | owner of the access log file (`user[:group]`)      | `root`                |
+| `access_log_mode`  | mode of the access log file (octal string)         | `0640`                |
 | `arena_size`       | request arena size (bytes)                         | 32 MB                 |
 | `defaults`         | global timeouts (see below)                        | 10 / 30 / 60 seconds  |
 | `sites`            | array of virtual hosts                             | —                     |
@@ -235,6 +280,99 @@ The longest matching name wins, so `"gen.cgi/x/y"` runs `gen.cgi` with
 forwarded to the client (headers such as `Status:` are honoured).
 The broker switches to the configured user (if it can; otherwise the
 program exits with status 126).
+
+## Logging
+
+### Access log
+
+Every completed HTTP request is logged by the **master** process in the
+Apache "common" format:
+
+```
+127.0.0.1 - alice [22/Nov/2026:12:34:56 +0100] "GET /index.html HTTP/1.1" 200 1234
+```
+
+`client-ip - user [timestamp] "method path?query version" status bytes`.
+The second field (ident) is always `-`; `user` is the configured auth
+user when Basic authentication was required and succeeded, otherwise `-`;
+`bytes` is the size of the response (header + body, nothing for
+aborted connections).
+
+The httpd process never opens the log file — it sends each line over a
+socket pair to the master, which appends it. The file is opened with
+`O_APPEND` and each line is written with a single `write()`, so several
+corehttpd instances may share one access log file without corrupting
+each other's lines. The owner and mode are applied by the master at
+startup (it runs as root, so `chown`/`chmod` work).
+
+Configuration (in the main config file):
+
+| Key                | Meaning                                        | Default |
+|--------------------|------------------------------------------------|---------|
+| `access_log`       | path of the log file (absent = no access log)  | —       |
+| `access_log_owner` | `"user"` or `"user:group"` (names or numeric)  | `root`  |
+| `access_log_mode`  | mode as an octal string like `"0640"`          | `0640`  |
+
+If `access_log` is not set and the server runs in the **foreground**,
+access-log lines are written to **stdout** instead — which is exactly
+what you want under systemd, where stdout is collected by the journal.
+(The same happens if the configured file cannot be opened.) When
+daemonized without an `access_log`, no access log is written.
+
+### Error log
+
+The error log is configured in a **separate JSONC file**, so it can be
+maintained independently of the main configuration:
+
+```jsonc
+{
+  // Where to write (mandatory for file logging).
+  "file": "/var/log/corehttpd/error.log",
+
+  // Ownership and mode, applied by the master at startup.
+  "owner": "root:adm",
+  "mode": "0640",
+
+  // Minimum severity: "debug" < "info" < "warning" < "error"
+  // (default: "info").
+  "level": "warning"
+}
+```
+
+Pass it with `-e` / `--error-log-config` (default:
+`/etc/corehttpd/errorlog.jsonc`). If the file is missing or cannot be
+parsed, corehttpd logs to **stdout** only and continues — except when
+the file was requested explicitly, in which case a note is printed.
+Under systemd, stdout ends up in the journal, so no error-log file is
+needed at all.
+
+The master opens the error log and **all three processes** (master,
+httpd, CGI broker) write to it directly through an inherited
+descriptor with `O_APPEND`, so concurrent writers never interleave
+lines. Typical messages: startup and shutdown, TLS handshake failures,
+CGI `setuid`/`exec` failures, bind errors. In the foreground, messages
+are mirrored to stdout (the terminal / the systemd journal); with
+`--daemonize`, stdout is redirected into the error log (so *all*
+output lands there — configure an error log when daemonizing).
+
+Example:
+
+```
+[Sat Nov 21 09:12:03 2026] [info] corehttpd starting, config /etc/corehttpd/config.jsonc
+[Sat Nov 21 09:12:03 2026] [info] listening on ports 80 and 443
+[Sat Nov 21 09:14:22 2026] [warning] TLS handshake failed (client 203.0.113.7)
+[Sat Nov 21 09:20:41 2026] [info] received signal 15, shutting down
+[Sat Nov 21 09:20:41 2026] [info] shutdown complete
+```
+
+### Multiple instances
+
+Both logs are safe to share between instances running on the same
+machine (or writing to a shared volume): every writer appends with
+`O_APPEND` and writes one line per `write()` call. Set `access_log` to
+the same path in each instance's config and point `-e` at the same
+error-log config; the file owner/mode are simply re-applied by every
+master at startup.
 
 ## TLS / HTTPS
 
@@ -303,5 +441,8 @@ program exits with status 126).
 - TLS 1.3 only; clients limited to TLS ≤ 1.2 cannot connect.
 - ECDSA P-256 certificates only.
 - No TLS session resumption, no HTTP/2.
+- Access-log lines are batched by the master on a ~1 second cycle, so a
+  freshly completed request may take up to a second to appear in the
+  file.
 - Very large certificate chains: each file is limited to 1 MB and all
   config/TLS material must fit in the master's 10 MB config arena.

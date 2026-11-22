@@ -52,6 +52,9 @@ typedef struct Config {
     const char *key_file;
     struct TlsKey *tls_key;              /* loaded once by the master */
     const char *letsencrypt_root;
+    const char *access_log;              /* NULL = no access log */
+    const char *access_log_owner;        /* "user[:group]" */
+    int         access_log_mode;         /* -1 = default 0640 */
     size_t      arena_size;
     int         def_header_timeout, def_body_timeout, def_keepalive;
     SiteCfg   **sites; int n_sites;
@@ -78,7 +81,7 @@ typedef struct {
 } HttpRequest;
 
 /* unified I/O endpoint: plain fd or a TLS connection */
-typedef struct Conn { int fd; TlsConn *tls; } Conn;
+typedef struct Conn { int fd; TlsConn *tls; uint64_t nbytes; } Conn;
 
 int  http_read_request(Arena *, Conn *, HttpRequest *, int hdr_timeout,
                        int body_timeout);
