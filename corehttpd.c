@@ -178,6 +178,9 @@ static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
     const char *nm = forced_name ? forced_name : j_str(j, "name");
     d->name = nm ? arena_strdup(a, nm) : NULL;
 
+    /* deny: this directory (and everything below it) is not served */
+    d->deny = json_is_true(json_object_get(j, "deny"));
+
     /* ---- filesystem path ---- */
     const char *dr = j_str(j, "documentroot");
     if (dr) {
@@ -514,6 +517,10 @@ DirCfg *config_walk(DirCfg *root, char *path, char **rest,
             fs_buf[flen] = 0;
         }
         p += clen;
+        if (cur->deny) {
+            while (*p == '/') p++;   /* keep *rest consistent */
+            break;                   /* deny covers the whole subtree */
+        }
     }
     *rest = p;
     return cur;
@@ -1118,6 +1125,18 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
                          req.host ? req.host : site->name, req.path);
                 http_send_simple(&conn, 301, "Moved Permanently", loc, "", 0, head_only);
             }
+            access_log_request(ctx, &peer, &req, NULL, status,
+                               conn.nbytes - bytes0);
+            if (!req.keep_alive) break;
+            continue;
+        }
+
+        /* ---- denied subtrees (config "deny": true) ---- */
+        if (eff->deny) {
+            status = 404;
+            log_debug("client %s: denied subdir", ip);
+            http_send_simple(&conn, 404, "Not Found", NULL, "not found\n", 10,
+                             head_only);
             access_log_request(ctx, &peer, &req, NULL, status,
                                conn.nbytes - bytes0);
             if (!req.keep_alive) break;

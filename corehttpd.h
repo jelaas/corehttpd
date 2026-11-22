@@ -29,7 +29,8 @@ typedef struct CgiProgram {
 
 typedef struct DirCfg {
     const char *name;
-    const char *path;                    /* absolute fs path */
+    const char *path;                    /* absolute fs path (NULL for glob) */
+    int         deny;                    /* this subtree is not served */
     int         auth_required;
     const char *auth_user;
     const char *auth_pass;

@@ -296,6 +296,20 @@ the *actual matched component* (so `0*` matching `0123` maps to
 or `?` are always treated as patterns — literal directories with those
 characters in the name cannot be configured.
 
+**Deny entries**: a subdir with `"deny": true` is not served at all —
+the whole subtree below it answers `404 Not Found` (before any
+authentication, so protected names are not even revealed):
+
+```jsonc
+"subdirs": [
+  { "name": "0secret*", "deny": true },   // hide e.g. backups, drafts
+  { "name": ".git",      "deny": true }
+]
+```
+
+Deny entries can be literal or glob, and a denied directory stays
+denied even if deeper entries are configured.
+
 A site may carry its own TLS certificate (`cert_file`/`key_file`, always
 a pair). The certificate is chosen during the TLS handshake from the
 client's SNI server name; see "TLS / HTTPS" below. Sites without their
