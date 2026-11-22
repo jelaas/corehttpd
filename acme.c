@@ -1494,7 +1494,7 @@ static void acme_init(Acme *a, const char *directory) {
 }
 
 /* fetch a fresh replay nonce */
-static void acme_nonce(Acme *a, char nonce[128]) {
+static void acme_nonce(Acme *a, char nonce[512]) {
     HttpResp r;
     if (http_req(&r, a->nonce_url, NULL, NULL, 1) < 0)
         die("cannot fetch nonce: curl failed%s%s",
@@ -1503,7 +1503,7 @@ static void acme_nonce(Acme *a, char nonce[128]) {
         die("cannot fetch nonce (status %d)", r.status);
     const char *v = hdr_get(r.hdr, "Replay-Nonce");
     if (!v) die("no Replay-Nonce in response");
-    snprintf(nonce, 128, "%s", v);
+    snprintf(nonce, 512, "%s", v);
     http_resp_free(&r);
 }
 
@@ -1530,7 +1530,7 @@ static char *jws_post(Acme *a, const char *url, const char *payload,
                       int use_kid, const char *accept, char **loc_out) {
     char *result = NULL;
     for (int attempt = 0; attempt < 5; attempt++) {
-        char nonce[128];
+        char nonce[512];
         acme_nonce(a, nonce);
 
         json_t *prot = json_object();

@@ -50,6 +50,7 @@ char *arena_strdup(Arena *a, const char *s) {
 void arena_reset(Arena *a) { a->used = 0; }
 
 /* error logging (defined in the logging section below) */
+static int g_errfd;
 static void log_err(const char *fmt, ...);
 static void log_warn(const char *fmt, ...);
 static void log_info(const char *fmt, ...);
@@ -61,6 +62,7 @@ static void log_debug(const char *fmt, ...);
 static char *strip_jsonc(Arena *a, const char *s) {
     size_t n = strlen(s);
     char *out = arena_alloc(a, n + 1);
+    if (!out) return NULL;
     size_t o = 0; size_t i = 0;
     while (i < n) {
         if (s[i] == '"') {
@@ -87,6 +89,16 @@ static char *strip_jsonc(Arena *a, const char *s) {
 static int j_int(json_t *o, const char *k, int def) {
     json_t *v = o ? json_object_get(o, k) : NULL;
     return json_is_integer(v) ? (int)json_integer_value(v) : def;
+}
+
+/* timeouts in seconds, clamped to a sane range: a negative value would
+ * make poll() wait forever (slowloris) and a huge one would overflow
+ * the millisecond multiplication */
+static int j_timeout(json_t *o, const char *k, int def) {
+    int v = j_int(o, k, def);
+    if (v < 1) v = 1;
+    if (v > 86400) v = 86400;
+    return v;
 }
 static const char *j_str(json_t *o, const char *k) {
     json_t *v = o ? json_object_get(o, k) : NULL;
@@ -182,9 +194,17 @@ static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
     /* ---- auth: monotonic ---- */
     json_t *jauth = json_object_get(j, "auth");
     if (jauth) {
+        const char *au = j_str(jauth, "user");
+        const char *ap = j_str(jauth, "pass");
+        /* empty credentials would let a client authenticate with an
+         * empty "Basic :" header — refuse them at config load */
+        if (!au || !*au || !ap || !*ap) {
+            fprintf(stderr, "config: auth needs a non-empty user and pass\n");
+            return NULL;
+        }
         d->auth_required = 1;
-        d->auth_user = arena_strdup(a, j_str(jauth, "user") ? j_str(jauth, "user") : "");
-        d->auth_pass = arena_strdup(a, j_str(jauth, "pass") ? j_str(jauth, "pass") : "");
+        d->auth_user = arena_strdup(a, au);
+        d->auth_pass = arena_strdup(a, ap);
     } else if (parent) {
         d->auth_required = parent->auth_required;
         d->auth_user     = parent->auth_user;
@@ -200,11 +220,11 @@ static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
     } else { d->allow = own; d->n_allow = n_own; }
 
     /* ---- timeouts: free ---- */
-    d->header_timeout    = j_int(j, "header_timeout",
+    d->header_timeout    = j_timeout(j, "header_timeout",
                                  parent ? parent->header_timeout    : cfg->def_header_timeout);
-    d->body_timeout      = j_int(j, "body_timeout",
+    d->body_timeout      = j_timeout(j, "body_timeout",
                                  parent ? parent->body_timeout      : cfg->def_body_timeout);
-    d->keepalive_timeout = j_int(j, "keepalive_timeout",
+    d->keepalive_timeout = j_timeout(j, "keepalive_timeout",
                                  parent ? parent->keepalive_timeout : cfg->def_keepalive);
 
     /* ---- cgi: per-directory only, not inherited from the parent ---- */
@@ -232,9 +252,11 @@ static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
     if (json_is_array(subs)) {
         size_t n = json_array_size(subs);
         d->subdirs = arena_alloc(a, sizeof(DirCfg *) * n);
+        if (!d->subdirs) return NULL;
         for (size_t i = 0; i < n; i++) {
             DirCfg *cd = parse_dir(a, json_array_get(subs, i), d, cfg, NULL);
-            if (cd) d->subdirs[d->n_subdirs++] = cd;
+            if (!cd) return NULL;      /* config errors must be loud */
+            d->subdirs[d->n_subdirs++] = cd;
         }
     }
     return d;
@@ -280,6 +302,7 @@ Config *config_load(Arena *a, const char *path) {
     raw[sz] = 0; fclose(f);
 
     char *js = strip_jsonc(a, raw);
+    if (!js) { fprintf(stderr, "config: out of memory\n"); return NULL; }
     json_error_t err;
     json_t *root = json_loads(js, 0, &err);
     if (!root) { fprintf(stderr, "json: %s\n", err.text); return NULL; }
@@ -297,9 +320,9 @@ Config *config_load(Arena *a, const char *path) {
     c->arena_size       = j_int(root, "arena_size", 32u << 20);
 
     json_t *defs = json_object_get(root, "defaults");
-    c->def_header_timeout = j_int(defs, "header_timeout", 10);
-    c->def_body_timeout   = j_int(defs, "body_timeout",   30);
-    c->def_keepalive      = j_int(defs, "keepalive_timeout", 60);
+    c->def_header_timeout = j_timeout(defs, "header_timeout", 10);
+    c->def_body_timeout   = j_timeout(defs, "body_timeout",   30);
+    c->def_keepalive      = j_timeout(defs, "keepalive_timeout", 60);
 
     /* sites */
     json_t *sites = json_object_get(root, "sites");
@@ -314,6 +337,10 @@ Config *config_load(Arena *a, const char *path) {
             sc->cert_file = arena_strdup(a, j_str(s, "cert_file"));
             sc->key_file  = arena_strdup(a, j_str(s, "key_file"));
             sc->root = parse_dir(a, s, NULL, c, NULL);
+            if (!sc->root) {
+                json_decref(root);
+                return NULL;
+            }
             c->sites[c->n_sites++] = sc;
         }
     }
@@ -789,9 +816,11 @@ static int relay_cgi(Conn *c, int cgi_fd, int head_only) {
                     if (!nl) break;
                     if (!strncasecmp(line, "Status:", 7)) {
                         char st[256] = "200 OK";
-                        size_t l = (size_t)(nl - line - 7);
-                        if (l > sizeof(st) - 1) l = sizeof(st) - 1;
-                        memcpy(st, line + 8 < nl ? line + 8 : line + 7, l);
+                        const char *v = line + 7;
+                        while (*v == ' ' || *v == '\t') v++;
+                        size_t l = (size_t)(nl - v);
+                        if (l >= sizeof st) l = sizeof st - 1;
+                        memcpy(st, v, l);
                         st[l] = 0;
                         char *s = trim(st);
                         status = atoi(s);
@@ -885,7 +914,10 @@ static void access_log_request(struct SrvCtx *ctx,
         req->version ? req->version : "-",
         status, (unsigned long long)nbytes);
     if (n < 0) return;
-    if (n >= (int)sizeof line) n = (int)sizeof line - 1;
+    if (n >= (int)sizeof line) {
+        n = (int)sizeof line - 1;
+        line[n - 1] = '\n';    /* keep lines intact when truncated */
+    }
     send_fd_all(ctx->log_fd, line, (size_t)n);
 }
 
@@ -1191,16 +1223,32 @@ static void run_httpd(struct SrvCtx *ctx) {
 /* =====================================================================
  * cgi process
  * ===================================================================== */
+/* read exactly n bytes; the wire is a stream socketpair, so a single
+ * read() may return a partial chunk */
+static int read_all(int fd, void *buf, size_t n) {
+    char *p = buf;
+    while (n) {
+        ssize_t r = read(fd, p, n);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0) return -1;
+        p += r;
+        n -= (size_t)r;
+    }
+    return 0;
+}
+
 static int cgi_run_one(int cgi_fd) {
     struct CgiHdr h;
-    ssize_t n = read(cgi_fd, &h, sizeof(h));
-    if (n != (ssize_t)sizeof(h)) return -1;
+    if (read_all(cgi_fd, &h, sizeof(h)) < 0) return -1;
 
     char prog[1024], user[256];
     if (h.prog_len >= sizeof(prog) || h.user_len >= sizeof(user)) return -1;
-    if (read(cgi_fd, prog, h.prog_len) != (ssize_t)h.prog_len) return -1;
+    if (read_all(cgi_fd, prog, h.prog_len) < 0) return -1;
     prog[h.prog_len] = 0;
-    if (read(cgi_fd, user, h.user_len) != (ssize_t)h.user_len) return -1;
+    if (read_all(cgi_fd, user, h.user_len) < 0) return -1;
     user[h.user_len] = 0;
 
     /* peer is a trusted socketpair, but stay defensive about wire values */
@@ -1215,13 +1263,14 @@ static int cgi_run_one(int cgi_fd) {
 
     for (; ne < h.nenv; ne++) {
         uint32_t kl, vl;
-        if (read(cgi_fd, &kl, 4) != 4 || read(cgi_fd, &vl, 4) != 4) goto fail;
+        if (read_all(cgi_fd, &kl, 4) < 0 || read_all(cgi_fd, &vl, 4) < 0)
+            goto fail;
         if (kl > 4096 || vl > (1u << 20)) goto fail;
         char *e = malloc((size_t)kl + vl + 2);
         if (!e) goto fail;
-        if (read(cgi_fd, e, kl) != (ssize_t)kl) { free(e); goto fail; }
+        if (read_all(cgi_fd, e, kl) < 0) { free(e); goto fail; }
         e[kl] = '=';
-        if (vl && read(cgi_fd, e + kl + 1, vl) != (ssize_t)vl) {
+        if (vl && read_all(cgi_fd, e + kl + 1, vl) < 0) {
             free(e); goto fail;
         }
         e[kl + 1 + vl] = 0;
@@ -1231,7 +1280,7 @@ static int cgi_run_one(int cgi_fd) {
     if (h.body_len) {
         body = malloc(h.body_len);
         if (!body) goto fail;
-        if (read(cgi_fd, body, h.body_len) != (ssize_t)h.body_len) goto fail;
+        if (read_all(cgi_fd, body, h.body_len) < 0) goto fail;
     }
 
     pid_t pid = fork();
@@ -1261,6 +1310,12 @@ static int cgi_run_one(int cgi_fd) {
         if (p2 == 0) {
             dup2(inp[0], 0); dup2(outp[1], 1);
             close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]);
+            /* the CGI program must not inherit the control channel back
+             * to the httpd (cgi_fd) or any other server fds: a rogue or
+             * compromised CGI could otherwise read the next request's
+             * parameters or forge responses.  Keep only the error log. */
+            for (int i = 3; i < 1024; i++)
+                if (i != g_errfd) close(i);
             execve(prog, (char *const[]){ (char *)prog, NULL }, env);
             log_err("cgi: execve %s: %s", prog, strerror(errno));
             _exit(127);
@@ -1460,6 +1515,10 @@ static void errorlog_init(Arena *a, const char *path, int explicit_flag) {
     fclose(f);
 
     char *js = strip_jsonc(a, raw);
+    if (!js) {
+        fprintf(stderr, "corehttpd: error-log config %s: out of memory\n", path);
+        return;
+    }
     json_error_t err;
     json_t *root = json_loads(js, 0, &err);
     if (!root) {
