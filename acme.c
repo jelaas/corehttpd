@@ -1395,6 +1395,7 @@ typedef struct {
 typedef struct {
     const char *letsencrypt_root;
     const char *acme_account_key;   /* NULL = default location */
+    const char *acme_url;           /* NULL = Let's Encrypt */
     AcmeSite *sites;
     int n_sites;
 } AcmeCfg;
@@ -1426,6 +1427,9 @@ static AcmeCfg *read_cfg(const char *path) {
     c->acme_account_key = j_str(root, "acme_account_key")
                             ? xstrdup(j_str(root, "acme_account_key"))
                             : NULL;
+    c->acme_url = j_str(root, "acme_url")
+                    ? xstrdup(j_str(root, "acme_url"))
+                    : NULL;
 
     json_t *sites = json_object_get(root, "sites");
     c->n_sites = 0;
@@ -1906,9 +1910,10 @@ static void usage(FILE *out) {
         "\n"
         "CONFIG defaults to /etc/corehttpd/config.jsonc.  The program\n"
         "reads letsencrypt_root from it (HTTP-01 challenge files are\n"
-        "written there, where corehttpd serves them) and, optionally,\n"
-        "acme_account_key (where the account key is stored).  Without\n"
-        "-d it issues one certificate for every site that has its own\n"
+        "written there, where corehttpd serves them), plus the optional\n"
+        "acme_account_key (where the account key is stored) and\n"
+        "acme_url (directory of the ACME provider).  Without -d it\n"
+        "issues one certificate for every site that has its own\n"
         "cert_file/key_file configured.\n"
         "\n"
         "Options:\n"
@@ -1921,7 +1926,8 @@ static void usage(FILE *out) {
         "                       acme-account.pem next to CONFIG)\n"
         "  --contact EMAIL      email to register with the ACME account\n"
         "  --staging            use the Let's Encrypt staging directory\n"
-        "  --acme-url URL       directory URL (default: Let's Encrypt\n"
+        "  --acme-url URL       ACME directory URL (default: the acme_url\n"
+        "                       from CONFIG, else Let's Encrypt\n"
         "                       production)\n"
         "  --renew-days N       skip sites whose certificate is still\n"
         "                       valid for more than N days (default: 30,\n"
@@ -1990,12 +1996,16 @@ int main(int argc, char **argv) {
         }
     }
 
+    AcmeCfg *cfg = read_cfg(cfgpath);
+
+    /* directory URL precedence: --acme-url, then --staging, then the
+     * config file's acme_url (so other ACME providers work), then the
+     * Let's Encrypt production directory */
     if (!acme_url)
         acme_url = staging
             ? "https://acme-staging-v02.api.letsencrypt.org/directory"
-            : "https://acme-v02.api.letsencrypt.org/directory";
-
-    AcmeCfg *cfg = read_cfg(cfgpath);
+            : (cfg->acme_url ? cfg->acme_url
+                             : "https://acme-v02.api.letsencrypt.org/directory");
 
     /* account key location: --account-key wins, then the config file's
      * acme_account_key, then acme-account.pem next to the config (the

@@ -166,6 +166,11 @@ The configuration file is **JSONC** — JSON with C-style comments
   // when the root filesystem is mounted read-only.
   "acme_account_key": "/var/lib/corehttpd/acme-account.pem",
 
+  // ACME directory URL used by the companion program (optional).
+  // Defaults to Let's Encrypt; set this to use a different ACME
+  // provider (ZeroSSL, Buypass, an internal CA, ...).
+  "acme_url": "https://acme.zerossl.com/v2/DV90",
+
   // Access log (optional).  Written by the master process in the
   // Apache "common" format.  If omitted, no access log is written.
   "access_log": "/var/log/corehttpd/access.log",
@@ -248,6 +253,7 @@ The configuration file is **JSONC** — JSON with C-style comments
 | `key_file`         | PEM/DER EC private key (P-256, SEC1 or PKCS#8)     | —                     |
 | `letsencrypt_root` | where ACME challenge files are read from           | `/var/www/letsencrypt`|
 | `acme_account_key` | where corehttpd-acme stores its account key         | `acme-account.pem` next to the config |
+| `acme_url`         | ACME directory URL used by corehttpd-acme           | Let's Encrypt production |
 | `access_log`       | access log file (absent = no access log)           | —                     |
 | `access_log_owner` | owner of the access log file (`user[:group]`)      | `root`                |
 | `access_log_mode`  | mode of the access log file (octal string)         | `0640`                |
@@ -513,7 +519,8 @@ corehttpd-acme [OPTIONS] [CONFIG]
                        CONFIG, else acme-account.pem next to CONFIG)
   --contact EMAIL      email to register with the ACME account
   --staging            use the Let's Encrypt staging directory
-  --acme-url URL       directory URL (default: Let's Encrypt production)
+  --acme-url URL       ACME directory URL (default: the acme_url from
+                       CONFIG, else Let's Encrypt production)
   --renew-days N       skip certificates valid for more than N days
                        (default: 30; 0 = always renew)
   --self-check-base U  fetch challenge files from U instead of
@@ -535,6 +542,25 @@ entry exists for machines whose root filesystem is mounted read-only —
 point it at a writable location (e.g. `/var/lib/corehttpd/`). If the
 account key is lost, a new account is created on the next run. Keep the
 account key file safe (mode 0600, root only).
+
+### Other ACME providers
+
+Any ACME v2 directory works, not just Let's Encrypt. Set `acme_url` in
+the configuration:
+
+```jsonc
+{
+  "acme_url": "https://acme.zerossl.com/v2/DV90",   // or Buypass, GTS, ...
+  "sites": [ ... ]
+}
+```
+
+The directory URL is resolved in this order: the `--acme-url` option,
+then `--staging` (the Let's Encrypt staging directory), then the
+`acme_url` entry in the configuration, then the Let's Encrypt
+production directory. Everything else — HTTP-01 verification, the
+ECDSA P-256 keys, the CSR — is provider-independent. Note that the
+certificates must still be ECDSA P-256 for corehttpd.
 
 ## Request handling
 
