@@ -1805,6 +1805,11 @@ int main(int argc, char **argv) {
     }
     close(cgi_pair[0]);
     if (log_pair[1] >= 0) close(log_pair[1]);
+    /* the master no longer needs the listening sockets: the httpd child
+     * has its own copies, and the master never accepts from them.  Close
+     * them so only the unprivileged httpd process holds ports 80/443. */
+    close(srv80);
+    close(srv443);
     /* note: sigpipe[1] stays open in the master — the signal handler
      * writes to it to wake the poll loop */
     log_info("master running (httpd pid %d, cgi pid %d)",
@@ -1861,7 +1866,6 @@ int main(int argc, char **argv) {
 
     kill(cgi_pid, SIGTERM);
     waitpid(cgi_pid, NULL, 0);
-    close(srv80); close(srv443);
     if (access_fd > 2) close(access_fd);
     log_info("shutdown complete");
     return 0;

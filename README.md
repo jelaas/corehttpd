@@ -77,9 +77,11 @@ The server consists of three processes:
 1. **master** — runs as root. Reads the configuration, reads the TLS
    certificate and private key *once*, opens ports 80 and 443, and forks
    the other processes. It writes all access-log lines to disk (the httpd
-   process sends them to it over a socket pair). On `SIGTERM`/`SIGINT` it
-   forwards the signal to the httpd process, waits for the in-flight
-   request to finish, then terminates the CGI broker and exits.
+   process sends them to it over a socket pair). After forking it closes
+   the listening sockets, so only the unprivileged httpd process holds
+   ports 80/443. On `SIGTERM`/`SIGINT` it forwards the signal to the
+   httpd process, waits for the in-flight request to finish, then
+   terminates the CGI broker and exits.
 2. **httpd** — handles all HTTP/HTTPS requests. Drops privileges to the
    configured `httpd_user`. Does not fork per request.
 3. **cgi broker** — started privileged (root) so it can switch to the
