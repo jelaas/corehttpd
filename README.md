@@ -29,6 +29,10 @@ Features:
 - Error log (configurable in a separate JSONC file) used by all
   processes: startup/shutdown, request problems, CGI failures
 - `--daemonize` flag for systems without a service manager
+- Companion program `corehttpd-acme` that fetches certificates from
+  Let's Encrypt (ACME v2, HTTP-01) and installs them where the config
+  expects them — challenge files go into `letsencrypt_root`, where
+  corehttpd serves them
 - All request memory comes from a single arena that is reset after each
   request
 
@@ -43,7 +47,8 @@ Requirements:
 make
 ```
 
-This produces a static binary `./corehttpd`.
+This produces the static binaries `./corehttpd` and
+`./corehttpd-acme` (the Let's Encrypt companion).
 
 ## Running
 
@@ -156,6 +161,11 @@ The configuration file is **JSONC** — JSON with C-style comments
   // (default: /var/www/letsencrypt).
   "letsencrypt_root": "/var/www/letsencrypt",
 
+  // Where the ACME companion keeps its account key (optional; the
+  // companion program reads this).  Point it at a writable filesystem
+  // when the root filesystem is mounted read-only.
+  "acme_account_key": "/var/lib/corehttpd/acme-account.pem",
+
   // Access log (optional).  Written by the master process in the
   // Apache "common" format.  If omitted, no access log is written.
   "access_log": "/var/log/corehttpd/access.log",
@@ -237,6 +247,7 @@ The configuration file is **JSONC** — JSON with C-style comments
 | `cert_file`        | PEM certificate chain (or single DER); the default cert | —               |
 | `key_file`         | PEM/DER EC private key (P-256, SEC1 or PKCS#8)     | —                     |
 | `letsencrypt_root` | where ACME challenge files are read from           | `/var/www/letsencrypt`|
+| `acme_account_key` | where corehttpd-acme stores its account key         | `acme-account.pem` next to the config |
 | `access_log`       | access log file (absent = no access log)           | —                     |
 | `access_log_owner` | owner of the access log file (`user[:group]`)      | `root`                |
 | `access_log_mode`  | mode of the access log file (octal string)         | `0640`                |
@@ -411,6 +422,10 @@ master at startup.
   readable by root — the unprivileged httpd user never reads them.
   Identical `(cert_file, key_file)` pairs referenced by several sites
   are loaded only once.
+- Certificate files that do not exist yet are **not fatal**: corehttpd
+  starts with a warning and serves the default certificate for those
+  sites (this is what makes the ACME HTTP-01 bootstrap possible, see
+  below). Unreadable or invalid files, however, abort startup.
 - No PSK, session resumption, early data or ALPN. Clients get a fresh
   full handshake per connection, which is fine for browsers.
 - The `openssl` CLI is *not* required at runtime; it is only convenient
@@ -422,6 +437,104 @@ master at startup.
       -subj "/CN=example.com" \
       -addext "subjectAltName=DNS:example.com"
   ```
+
+## Let's Encrypt (ACME)
+
+`corehttpd-acme` is a companion program that obtains certificates from
+Let's Encrypt using the ACME v2 protocol with **HTTP-01 verification**
+and installs them at the paths corehttpd's configuration expects. It
+only needs the `curl` program for talking to the ACME server; account
+key generation, the ES256 JWS signatures and the CSR are computed
+in-process (same ECDSA P-256 code as tls.c).
+
+### Getting a certificate
+
+1. Configure a site with `cert_file`/`key_file` paths and a
+   `letsencrypt_root` (the HTTP-01 challenge files are written there;
+   the directory need not exist yet — it is created by the server):
+
+   ```jsonc
+   {
+     "letsencrypt_root": "/var/www/letsencrypt",
+     "sites": [
+       {
+         "name": "example.com",
+         "documentroot": "/srv/www/example.com",
+         "cert_file": "/etc/corehttpd/certs/example.com.pem",
+         "key_file":  "/etc/corehttpd/certs/example.com.key"
+       }
+     ]
+   }
+   ```
+
+   Note that corehttpd *starts even when these certificate files do not
+   exist yet* (it logs a warning and uses the default certificate for
+   that site) — that is exactly the state you need for the first run,
+   because the HTTP-01 challenge must be served on port 80.
+
+2. Make sure the domain resolves to the server and port 80 is reachable
+   from the internet, then run:
+
+   ```sh
+   corehttpd-acme
+   ```
+
+   It reads `/etc/corehttpd/config.jsonc`, issues one certificate for
+   every site with `cert_file`/`key_file` configured, writes the
+   challenge into `letsencrypt_root` (which corehttpd serves under
+   `/.well-known/acme-challenge/`), verifies the challenge itself over
+   HTTP before asking Let's Encrypt, downloads the certificate chain
+   and writes it (mode 0644) plus a fresh P-256 private key (mode
+   0600). The key format is SEC1 PEM, which corehttpd loads directly.
+
+3. Restart corehttpd to load the new certificates:
+   `kill $(pidof corehttpd)` (or `systemctl restart corehttpd@1`).
+
+### Renewing
+
+Run the same command again. Certificates that are still valid for more
+than `--renew-days` (default: 30) days are skipped; everything else is
+re-issued. This makes the tool cron-friendly:
+
+```cron
+17 3 * * * root /usr/local/sbin/corehttpd-acme
+30 3 * * * root pkill -x corehttpd || true
+```
+
+### Options
+
+```
+corehttpd-acme [OPTIONS] [CONFIG]
+  -d, --domain NAME    domain for the certificate (repeatable)
+  --cert FILE          output certificate chain (with -d)
+  --key FILE           output private key (with -d)
+  --account-key FILE   ECDSA P-256 account key; created with mode 0600
+                       if missing (default: the acme_account_key from
+                       CONFIG, else acme-account.pem next to CONFIG)
+  --contact EMAIL      email to register with the ACME account
+  --staging            use the Let's Encrypt staging directory
+  --acme-url URL       directory URL (default: Let's Encrypt production)
+  --renew-days N       skip certificates valid for more than N days
+                       (default: 30; 0 = always renew)
+  --self-check-base U  fetch challenge files from U instead of
+                       http://<domain> (for testing)
+  -h, --help           show this help and exit
+```
+
+Without `-d`, one certificate per site (its configured paths are used).
+With `-d NAME`, one certificate for the given domain(s); `--cert`/`--key`
+name the output files (or the matching site's paths are used). Use
+`--staging` for your first experiments — the staging directory issues
+untrusted certificates but has generous rate limits.
+
+The ACME account is identified by the account key; the first run
+creates it. Where it lives is resolved in this order: the `--account-key`
+option, then the `acme_account_key` entry in the configuration file,
+then `acme-account.pem` next to the configuration file. The config
+entry exists for machines whose root filesystem is mounted read-only —
+point it at a writable location (e.g. `/var/lib/corehttpd/`). If the
+account key is lost, a new account is created on the next run. Keep the
+account key file safe (mode 0600, root only).
 
 ## Request handling
 
@@ -454,6 +567,10 @@ master at startup.
 - The httpd process runs unprivileged; the only privileged operations
   (binding low ports, reading the private key, switching CGI users) live
   in the master and the CGI broker.
+- `corehttpd-acme` keeps an ACME account key (mode 0600; location:
+  `--account-key`, else `acme_account_key` in the config, else
+  `acme-account.pem` next to the config). It identifies your ACME
+  account — protect it like any private key.
 
 ## Known limitations
 
@@ -470,3 +587,5 @@ master at startup.
   config/TLS material (the global pair *plus every site's pair*) must
   fit in the master's 10 MB config arena. Keep the total number of
   sites with distinct certificates modest, or raise the arena.
+- `corehttpd-acme` requires the `curl` program at runtime; only HTTP-01
+  verification is supported (no DNS-01, no wildcard certificates).

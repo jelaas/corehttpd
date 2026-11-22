@@ -49,6 +49,12 @@ char *arena_strdup(Arena *a, const char *s) {
 }
 void arena_reset(Arena *a) { a->used = 0; }
 
+/* error logging (defined in the logging section below) */
+static void log_err(const char *fmt, ...);
+static void log_warn(const char *fmt, ...);
+static void log_info(const char *fmt, ...);
+static void log_debug(const char *fmt, ...);
+
 /* =====================================================================
  * jsonc – strip comments but preserve strings
  * ===================================================================== */
@@ -254,6 +260,11 @@ static TlsKey *key_load_cached(Arena *a, const char *cf, const char *kf,
     return k;
 }
 
+static int file_exists(const char *p) {
+    struct stat st;
+    return p && stat(p, &st) == 0;
+}
+
 Config *config_load(Arena *a, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return NULL; }
@@ -320,11 +331,20 @@ Config *config_load(Arena *a, const char *path) {
             json_decref(root);
             return NULL;
         }
-        c->tls_key = key_load_cached(a, c->cert_file, c->key_file, keys, &nkeys);
-        if (!c->tls_key) {
-            fprintf(stderr, "config: failed to load TLS key\n");
-            json_decref(root);
-            return NULL;
+        if (!file_exists(c->cert_file) || !file_exists(c->key_file)) {
+            /* not there yet: start without a default certificate so the
+             * HTTP-01 bootstrap (ACME challenges on port 80) works */
+            log_warn("config: %s/%s do not exist yet; starting without a "
+                     "default certificate",
+                     c->cert_file, c->key_file);
+        } else {
+            c->tls_key = key_load_cached(a, c->cert_file, c->key_file,
+                                         keys, &nkeys);
+            if (!c->tls_key) {
+                fprintf(stderr, "config: failed to load TLS key\n");
+                json_decref(root);
+                return NULL;
+            }
         }
     }
     for (int i = 0; i < c->n_sites; i++) {
@@ -335,6 +355,16 @@ Config *config_load(Arena *a, const char *path) {
                         sc->name ? sc->name : "?");
                 json_decref(root);
                 return NULL;
+            }
+            if (!file_exists(sc->cert_file) || !file_exists(sc->key_file)) {
+                /* the site starts with the default certificate; once the
+                 * files appear (e.g. after corehttpd-acme fetches them),
+                 * restart the server */
+                log_warn("config: site %s: %s/%s do not exist yet; using "
+                         "the default certificate",
+                         sc->name ? sc->name : "?",
+                         sc->cert_file, sc->key_file);
+                continue;
             }
             sc->tls_key = key_load_cached(a, sc->cert_file, sc->key_file,
                                           keys, &nkeys);
@@ -421,6 +451,12 @@ static int send_all(Conn *c, const void *buf, size_t n) {
     return 0;
 }
 
+/* error logging (defined in the logging section below) */
+static void log_err(const char *fmt, ...);
+static void log_warn(const char *fmt, ...);
+static void log_info(const char *fmt, ...);
+static void log_debug(const char *fmt, ...);
+
 /* raw-fd variant for the cgi socketpair */
 static int send_fd_all(int fd, const void *buf, size_t n) {
     const char *p = buf;
@@ -431,12 +467,6 @@ static int send_fd_all(int fd, const void *buf, size_t n) {
     }
     return 0;
 }
-
-/* error logging (defined in the logging section below) */
-static void log_err(const char *fmt, ...);
-static void log_warn(const char *fmt, ...);
-static void log_info(const char *fmt, ...);
-static void log_debug(const char *fmt, ...);
 
 static int b64_val(int c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
