@@ -178,8 +178,15 @@ static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
     const char *nm = forced_name ? forced_name : j_str(j, "name");
     d->name = nm ? arena_strdup(a, nm) : NULL;
 
-    /* deny: this directory (and everything below it) is not served */
-    d->deny = json_is_true(json_object_get(j, "deny"));
+    /* deny: this directory (and everything below it) is not served.
+     * Inherited, so a denied parent also covers configured children.
+     * Anything but a JSON boolean is a config error (fail closed). */
+    json_t *jdeny = json_object_get(j, "deny");
+    if (jdeny && !json_is_boolean(jdeny)) {
+        fprintf(stderr, "config: \"deny\" must be true or false\n");
+        return NULL;
+    }
+    d->deny = json_is_true(jdeny) || (parent && parent->deny);
 
     /* ---- filesystem path ---- */
     const char *dr = j_str(j, "documentroot");
@@ -488,15 +495,20 @@ DirCfg *config_walk(DirCfg *root, char *path, char **rest,
             }
         }
         if (!m) {
-            /* otherwise the longest matching glob pattern */
+            /* otherwise the matching glob pattern: any deny pattern
+             * wins, then the longest, ties go to the first entry */
             size_t best = 0;
             for (int i = 0; i < cur->n_subdirs; i++) {
-                const char *n = cur->subdirs[i]->name;
+                DirCfg *c = cur->subdirs[i];
+                const char *n = c->name;
                 if (!n) continue;
-                if ((strchr(n, '*') || strchr(n, '?')) &&
-                    glob_match(n, p, clen) && strlen(n) > best) {
-                    m = cur->subdirs[i];
-                    best = strlen(n);
+                if (!(strchr(n, '*') || strchr(n, '?')) ||
+                    !glob_match(n, p, clen)) continue;
+                size_t nl = strlen(n);
+                if (!m || (c->deny && !m->deny) ||
+                    (c->deny == m->deny && nl > best)) {
+                    m = c;
+                    best = nl;
                 }
             }
         }
@@ -825,6 +837,21 @@ static int auth_check(DirCfg *d, const char *hdr) {
     return ct_eq((char*)dec, d->auth_user) && ct_eq(colon + 1, d->auth_pass);
 }
 
+/* true if the URL path is absolute and has no "." or ".." segments */
+static int path_is_clean(const char *path) {
+    if (!path || path[0] != '/') return 0;
+    for (const char *p = path; *p; ) {
+        while (*p == '/') p++;
+        const char *e = p;
+        while (*e && *e != '/') e++;
+        size_t l = (size_t)(e - p);
+        if ((l == 1 && p[0] == '.') ||
+            (l == 2 && p[0] == '.' && p[1] == '.')) return 0;
+        p = e;
+    }
+    return 1;
+}
+
 /* true if path, after symlink resolution, stays inside root */
 static int path_within_root(const char *root, const char *path) {
     char rr[PATH_MAX], rp[PATH_MAX];
@@ -1066,6 +1093,18 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
                                   ctx->cfg->def_body_timeout);
         if (r < 0) {
             log_debug("client %s: request read failed or timed out", ip);
+            break;
+        }
+
+        /* The path is matched against the config as-is, so "." and ".."
+         * segments would slip past deny/auth/ip_allow entries (e.g.
+         * "/./.git/config").  Refuse them, and anything not absolute. */
+        if (!path_is_clean(req.path)) {
+            status = 400;
+            http_send_simple(&conn, 400, "Bad Request", NULL,
+                             "bad path\n", 9, !strcmp(req.method, "HEAD"));
+            access_log_request(ctx, &peer, &req, NULL, status,
+                               conn.nbytes - bytes0);
             break;
         }
 

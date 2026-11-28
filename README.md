@@ -308,7 +308,15 @@ authentication, so protected names are not even revealed):
 ```
 
 Deny entries can be literal or glob, and a denied directory stays
-denied even if deeper entries are configured.
+denied even if deeper entries are configured (children inherit `deny`,
+also from a denied site root). Among matching *patterns* a deny entry
+always wins, regardless of length or order; a *literal* name still wins
+over patterns, so a literal entry can carve out an exception. `deny`
+must be a JSON boolean — any other value is a config error.
+
+Request paths containing `.` or `..` segments are rejected with
+`400 Bad Request`, so they cannot be used to step around deny, auth or
+`ip_allow` entries.
 
 A site may carry its own TLS certificate (`cert_file`/`key_file`, always
 a pair). The certificate is chosen during the TLS handshake from the
