@@ -959,11 +959,11 @@ static const unsigned char *der_next(const unsigned char *p,
     size_t len = *p++;
     if (len & 0x80) {
         size_t n = len & 0x7f;
-        if (n == 0 || n > 2 || p + n > end) return NULL;
+        if (n == 0 || n > 2 || (size_t)(end - p) < n) return NULL;
         len = 0;
         while (n--) len = (len << 8) | *p++;
     }
-    if (p + len > end) return NULL;
+    if ((size_t)(end - p) < len) return NULL;
     return p + len;
 }
 
@@ -976,11 +976,11 @@ static const unsigned char *der_enter(const unsigned char *p,
     size_t len = *p++;
     if (len & 0x80) {
         size_t n = len & 0x7f;
-        if (n == 0 || n > 2 || p + n > end) return NULL;
+        if (n == 0 || n > 2 || (size_t)(end - p) < n) return NULL;
         len = 0;
         while (n--) len = (len << 8) | *p++;
     }
-    if (p + len > end) return NULL;
+    if ((size_t)(end - p) < len) return NULL;
     return p;
 }
 
@@ -993,11 +993,11 @@ static int der_scalar_in(const unsigned char *p, const unsigned char *end,
     size_t len = *p++;
     if (len & 0x80) {
         size_t n = len & 0x7f;
-        if (n == 0 || n > 2 || p + n > end) return -1;
+        if (n == 0 || n > 2 || (size_t)(end - p) < n) return -1;
         len = 0;
         while (n--) len = (len << 8) | *p++;
     }
-    if (p + len > end) return -1;
+    if ((size_t)(end - p) < len) return -1;
     if (tag == 0x04 && len == 32) {
         memcpy(scalar, p, 32);
         return 0;
@@ -1095,7 +1095,9 @@ static long asn1_time_days(const unsigned char *p, const unsigned char *end) {
     if (p >= end) return -1;
     size_t len = *p++;
     if (len & 0x80) return -1;
-    if (p + len > end) return -1;
+    if ((size_t)(end - p) < len) return -1;
+    for (size_t i = 0; i + 1 < len; i++)          /* all digits before 'Z' */
+        if (p[i] < '0' || p[i] > '9') return -1;
     int y, mo, d;
     if (tag == 0x17 && len == 13) {                /* UTCTime YYMMDDhhmmssZ */
         y = (p[0]-'0')*10 + (p[1]-'0');
@@ -1249,13 +1251,22 @@ static const char *hdr_get(const char *hdr, const char *name) {
     return NULL;
 }
 
-/* one curl invocation.  post = NULL for GET; head = send HEAD.
+/* one curl invocation.  post = NULL for GET; head = send HEAD.  URLs
+ * mostly come from the ACME server, so only https:// is accepted (http://
+ * only for the HTTP-01 self-check), curl is limited to that protocol and
+ * the URL is passed with --url so it can never be taken as an option.
  * Returns 0 and fills r on HTTP-level success (status parsed), -1 when
- * curl itself failed. */
-static int http_req(HttpResp *r, const char *url, const char *post,
-                    const char *accept, int head) {
+ * curl itself failed or the URL was refused. */
+static int http_req_proto(HttpResp *r, const char *url, const char *post,
+                          const char *accept, int head, int allow_http) {
     memset(r, 0, sizeof(*r));
     r->status = -1;
+    if (strncmp(url, "https://", 8) != 0 &&
+        !(allow_http && strncmp(url, "http://", 7) == 0)) {
+        snprintf(r->err, sizeof r->err, "refusing URL %.200s (%s only)",
+                 url, allow_http ? "http/https" : "https");
+        return -1;
+    }
     int outp[2], errp[2];
     if (pipe(outp) < 0 || pipe(errp) < 0) return -1;
     int inp[2];
@@ -1278,6 +1289,8 @@ static int http_req(HttpResp *r, const char *url, const char *post,
         char acc[96];
         args[na++] = "curl";
         args[na++] = "-sS";
+        args[na++] = "--proto";
+        args[na++] = allow_http ? "=http,https" : "=https";
         args[na++] = "-D";
         args[na++] = "-";
         if (head) {
@@ -1298,6 +1311,7 @@ static int http_req(HttpResp *r, const char *url, const char *post,
                  accept ? accept : (post ? "application/json" : "*/*"));
         args[na++] = "-H";
         args[na++] = acc;
+        args[na++] = "--url";
         args[na++] = (char *)url;
         args[na] = NULL;
         execvp("curl", args);
@@ -1388,6 +1402,11 @@ static int http_req(HttpResp *r, const char *url, const char *post,
         }
     }
     return 0;
+}
+
+static int http_req(HttpResp *r, const char *url, const char *post,
+                    const char *accept, int head) {
+    return http_req_proto(r, url, post, accept, head, 0);
 }
 
 /* =====================================================================
@@ -1622,6 +1641,8 @@ static void acme_account(Acme *a, const char *contact) {
     printf("account: %s\n", a->kid);
 }
 
+static int write_all_fd(int fd, const char *p, size_t left);
+
 /* one HTTP-01 authorization: write the challenge, answer, poll */
 static void acme_authorize(Acme *a, const char *authz_url,
                            const char *letsencrypt_root,
@@ -1668,11 +1689,18 @@ static void acme_authorize(Acme *a, const char *authz_url,
     char path[1024];
     int pl = snprintf(path, sizeof path, "%s/%s", letsencrypt_root, token);
     if (pl < 0 || (size_t)pl >= sizeof path) die("challenge path too long");
-    FILE *f = fopen(path, "w");
-    if (!f) die("cannot write challenge file %s: %s", path, strerror(errno));
-    fprintf(f, "%s\n", keyauth);
-    fclose(f);
-    chmod(path, 0644);
+    /* created fresh (O_EXCL, no symlinks): this runs as root and the
+     * directory may be writable by others */
+    if (unlink(path) < 0 && errno != ENOENT)
+        die("cannot remove stale %s: %s", path, strerror(errno));
+    int cfd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                   0644);
+    if (cfd < 0) die("cannot write challenge file %s: %s", path, strerror(errno));
+    char line[300];
+    int ll = snprintf(line, sizeof line, "%s\n", keyauth);
+    if (fchmod(cfd, 0644) < 0 || write_all_fd(cfd, line, (size_t)ll) < 0 ||
+        close(cfd) < 0)
+        die("cannot write challenge file %s: %s", path, strerror(errno));
 
     /* self-check over HTTP before asking the CA to validate */
     char url[1024];
@@ -1686,7 +1714,7 @@ static void acme_authorize(Acme *a, const char *authz_url,
              token);
     HttpResp r;
     int ok = 0;
-    if (http_req(&r, url, NULL, NULL, 0) == 0 && r.status == 200) {
+    if (http_req_proto(&r, url, NULL, NULL, 0, 1) == 0 && r.status == 200) {
         char *b = r.body;
         while (*b == ' ' || *b == '\t') b++;
         size_t bl = strlen(b);
@@ -1709,8 +1737,9 @@ static void acme_authorize(Acme *a, const char *authz_url,
     body = jws_post(a, churl, "{}", 1, NULL, NULL);
     free(body);
 
-    /* poll the authorization until it is decided */
-    const char *status = NULL;
+    /* poll the authorization until it is decided; the status is copied
+     * out because the JSON object is freed on every iteration */
+    char status[32] = "";
     for (int i = 0; i < 60; i++) {
         sleep(2);
         body = jws_post(a, authz_url, "", 1, NULL, NULL);
@@ -1718,18 +1747,15 @@ static void acme_authorize(Acme *a, const char *authz_url,
         free(body);
         if (!j2) die("authorization: bad JSON: %s", err.text);
         const char *st = j_str(j2, "status");
-        if (st) status = st;
-        if (status && (!strcmp(status, "valid") || !strcmp(status, "invalid"))) {
-            json_decref(j2);
-            break;
-        }
+        if (st) snprintf(status, sizeof status, "%s", st);
         json_decref(j2);
+        if (!strcmp(status, "valid") || !strcmp(status, "invalid")) break;
     }
     json_decref(j);
-    if (!status || strcmp(status, "valid")) {
+    if (strcmp(status, "valid")) {
         unlink(path);
         die("authorization for %s not validated (status %s)",
-            domain, status ? status : "?");
+            domain, status[0] ? status : "?");
     }
     unlink(path);                                  /* challenge done */
 }
@@ -1788,13 +1814,15 @@ static int cert_is_staging(const char *path) {
             continue;
         }
         const unsigned char *sq = der_enter(r, iend);
-        if (sq && *sq == 0x30) {
+        if (sq && sq < iend && *sq == 0x30) {
             const unsigned char *sc = der_enter(sq, iend);
-            if (sc && sc[0] == 0x06 && sc[1] == 3 && sc[2] == 0x55 &&
-                sc[3] == 0x04 && (sc[4] == 0x03 || sc[4] == 0x0a)) {
+            if (sc && iend - sc >= 5 && sc[0] == 0x06 && sc[1] == 3 &&
+                sc[2] == 0x55 && sc[3] == 0x04 &&
+                (sc[4] == 0x03 || sc[4] == 0x0a)) {
                 /* OID 2.5.4.3 (CN) or 2.5.4.10 (O) */
                 const unsigned char *val = der_next(sc, iend);
-                if (val && val[1] < 0x80 &&
+                if (val && iend - val >= 2 && val[1] < 0x80 &&
+                    iend - (val + 2) >= val[1] &&
                     (val[0] == 0x0c || val[0] == 0x13 || val[0] == 0x16)) {
                     char lb[64];
                     size_t vl = val[1];
@@ -1815,27 +1843,36 @@ static int cert_is_staging(const char *path) {
 /* =====================================================================
  * file output
  * ===================================================================== */
+static int write_all_fd(int fd, const char *p, size_t left) {
+    while (left) {
+        ssize_t w = write(fd, p, left);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += w;
+        left -= (size_t)w;
+    }
+    return 0;
+}
 static void write_file_atomic(const char *path, const char *content,
                               size_t len, mode_t mode) {
     char tmp[1024];
     int pl = snprintf(tmp, sizeof tmp, "%s.new", path);
     if (pl < 0 || (size_t)pl >= sizeof tmp) die("output path too long: %s", path);
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    /* a fresh file (O_EXCL, no symlinks): a planted "x.new" link must
+     * not make root write the private key somewhere else */
+    if (unlink(tmp) < 0 && errno != ENOENT)
+        die("cannot remove stale %s: %s", tmp, strerror(errno));
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
     if (fd < 0) die("cannot create %s: %s", tmp, strerror(errno));
     if (fchmod(fd, mode) < 0)
         die("cannot chmod %s: %s", tmp, strerror(errno));
-    const char *p = content;
-    size_t left = len;
-    while (left) {
-        ssize_t w = write(fd, p, left);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            close(fd);
-            unlink(tmp);
-            die("cannot write %s: %s", tmp, strerror(errno));
-        }
-        p += w;
-        left -= (size_t)w;
+    if (write_all_fd(fd, content, len) < 0 || fsync(fd) < 0) {
+        int e = errno;
+        close(fd);
+        unlink(tmp);
+        die("cannot write %s: %s", tmp, strerror(e));
     }
     close(fd);
     if (rename(tmp, path) < 0) {

@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <sys/time.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <jansson.h>
@@ -47,7 +48,14 @@ char *arena_strdup(Arena *a, const char *s) {
     if (p) memcpy(p, s, n);
     return p;
 }
-void arena_reset(Arena *a) { a->used = 0; }
+/* zero everything handed out since the last reset (memory above "used"
+ * is still zero from the previous reset or the initial mmap), so no
+ * request data — credentials, bodies, TLS handshake buffers — survives
+ * into the next request */
+void arena_reset(Arena *a) {
+    memset(a->base, 0, a->used);
+    a->used = 0;
+}
 
 /* error logging (defined in the logging section below) */
 static int g_errfd;
@@ -120,63 +128,127 @@ static int j_mode(json_t *o, const char *k, int def) {
     return def;
 }
 
-static Acl *parse_acl(Arena *a, json_t *arr, int *n_out) {
-    *n_out = 0;
-    if (!json_is_array(arr)) return NULL;
-    size_t len = json_array_size(arr);
-    Acl *out = arena_alloc(a, sizeof(Acl) * len);
-    if (!out) return NULL;
-    for (size_t i = 0; i < len; i++) {
-        const char *s = json_string_value(json_array_get(arr, i));
-        if (!s) continue;
-        char buf[80]; strncpy(buf, s, sizeof(buf) - 1); buf[79] = 0;
-        char *slash = strchr(buf, '/');
-        int bits = 32;
-        if (slash) { *slash = 0; bits = atoi(slash + 1); }
-        if (bits < 0) bits = 0;
-	if (bits > 32) bits = 32;
-        struct in_addr ia;
-        if (inet_pton(AF_INET, buf, &ia) != 1) continue;
-        uint32_t host = ntohl(ia.s_addr);
-        uint32_t mask = bits == 0 ? 0u
-                      : bits == 32 ? 0xffffffffu
-                      : (0xffffffffu << (32 - bits));
-        out[*n_out].net  = host & mask;
-        out[*n_out].mask = mask;
-        (*n_out)++;
+/* "a.b.c.d" or "a.b.c.d/n" (n = 0..32).  Strict: a typo must never turn
+ * into an allow-all rule. */
+static int parse_acl_entry(const char *s, Acl *out) {
+    char buf[32];
+    size_t l = strlen(s);
+    if (l == 0 || l >= sizeof buf) return -1;
+    memcpy(buf, s, l + 1);
+    int bits = 32;
+    char *slash = strchr(buf, '/');
+    if (slash) {
+        *slash = 0;
+        const char *b = slash + 1;
+        size_t bl = strlen(b);
+        if (bl < 1 || bl > 2 || strspn(b, "0123456789") != bl) return -1;
+        bits = atoi(b);
+        if (bits > 32) return -1;
     }
-    return out;
+    struct in_addr ia;
+    if (inet_pton(AF_INET, buf, &ia) != 1) return -1;
+    uint32_t mask = bits == 0 ? 0u : (0xffffffffu << (32 - bits));
+    out->net  = ntohl(ia.s_addr) & mask;
+    out->mask = mask;
+    return 0;
 }
 
-/* intersect two ACL lists; result denies nothing that both allow */
-static int acl_intersect(Arena *a,
-                         const Acl *x, int nx, const Acl *y, int ny,
-                         Acl **out) {
-    if (nx == 0) { *out = (Acl*)y; return ny; }
-    if (ny == 0) { *out = (Acl*)x; return nx; }
-    if ((size_t)nx * (size_t)ny > a->size / sizeof(Acl)) return 0;
-    Acl *o = arena_alloc(a, sizeof(Acl) * (size_t)nx * (size_t)ny);
-    if (!o) return 0;
+/* parse an "ip_allow" array; any bad entry is a config error */
+static int parse_acl(Arena *a, json_t *arr, Acl **out, int *n_out) {
+    *out = NULL;
+    *n_out = 0;
+    if (!json_is_array(arr)) {
+        fprintf(stderr, "config: ip_allow must be an array of addresses\n");
+        return -1;
+    }
+    size_t len = json_array_size(arr);
+    if (len == 0) {
+        fprintf(stderr, "config: ip_allow is empty (omit it to allow "
+                "everyone)\n");
+        return -1;
+    }
+    if (len > 4096) {
+        fprintf(stderr, "config: ip_allow has too many entries\n");
+        return -1;
+    }
+    Acl *o = arena_alloc(a, sizeof(Acl) * len);
+    if (!o) {
+        fprintf(stderr, "config: out of memory (ip_allow)\n");
+        return -1;
+    }
+    for (size_t i = 0; i < len; i++) {
+        const char *s = json_string_value(json_array_get(arr, i));
+        if (!s || parse_acl_entry(s, &o[i]) < 0) {
+            fprintf(stderr, "config: bad ip_allow entry %s%s%s\n",
+                    s ? "\"" : "", s ? s : "(not a string)", s ? "\"" : "");
+            return -1;
+        }
+    }
+    *out = o;
+    *n_out = (int)len;
+    return 0;
+}
+
+/* Intersect two allow-lists: an address is allowed only if both lists
+ * allow it.  Two prefixes overlap only if they agree on the bits of the
+ * shorter one; the overlap is then the longer prefix.  An empty result
+ * is valid and means "deny all". */
+static int acl_intersect(Arena *a, const Acl *x, int nx, const Acl *y,
+                         int ny, Acl **out, int *n_out) {
+    *out = NULL;
+    *n_out = 0;
+    size_t cnt = (size_t)nx * (size_t)ny;
+    if (cnt > a->size / sizeof(Acl)) return -1;
+    Acl *o = arena_alloc(a, sizeof(Acl) * (cnt ? cnt : 1));
+    if (!o) return -1;
     int k = 0;
     for (int i = 0; i < nx; i++)
         for (int j = 0; j < ny; j++) {
-            uint32_t mask = x[i].mask & y[j].mask;
-            uint32_t net  = (x[i].net & y[j].net) & mask;
-            if (mask == 0 && net != 0) continue;
-            o[k].net = net; o[k].mask = mask; k++;
+            uint32_t common = x[i].mask & y[j].mask;
+            if ((x[i].net ^ y[j].net) & common) continue;      /* disjoint */
+            uint32_t mask = x[i].mask | y[j].mask;             /* longer prefix */
+            o[k].net  = (x[i].net | y[j].net) & mask;
+            o[k].mask = mask;
+            k++;
         }
     *out = o;
-    return k;
+    *n_out = k;
+    return 0;
+}
+
+/* CGI programs must run as an existing, non-root user */
+static int cgi_user_ok(const char *user) {
+    struct passwd *pw = getpwnam(user);
+    if (!pw) {
+        fprintf(stderr, "config: CGI user '%s' does not exist\n", user);
+        return 0;
+    }
+    if (pw->pw_uid == 0) {
+        fprintf(stderr, "config: CGI user '%s' is root; CGI programs must "
+                "not run as root\n", user);
+        return 0;
+    }
+    return 1;
 }
 
 static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
                          const Config *cfg, const char *forced_name) {
     if (!json_is_object(j)) return NULL;
     DirCfg *d = arena_alloc(a, sizeof(*d));
+    if (!d) { fprintf(stderr, "config: out of memory\n"); return NULL; }
     memset(d, 0, sizeof(*d));
 
     const char *nm = forced_name ? forced_name : j_str(j, "name");
-    d->name = nm ? arena_strdup(a, nm) : NULL;
+    if (parent && (!nm || !*nm || strchr(nm, '/') ||
+                   !strcmp(nm, ".") || !strcmp(nm, ".."))) {
+        fprintf(stderr, "config: every subdir needs a \"name\" that is a "
+                "single path component\n");
+        return NULL;
+    }
+    if (nm && !(d->name = arena_strdup(a, nm))) {
+        fprintf(stderr, "config: out of memory\n");
+        return NULL;
+    }
 
     /* deny: this directory (and everything below it) is not served.
      * Inherited, so a denied parent also covers configured children.
@@ -190,8 +262,19 @@ static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
 
     /* ---- filesystem path ---- */
     const char *dr = j_str(j, "documentroot");
+    if (!parent && !dr) {
+        /* no silent default: a forgotten documentroot used to serve "/" */
+        fprintf(stderr, "config: site %s needs a \"documentroot\"\n",
+                nm ? nm : "?");
+        return NULL;
+    }
+    if (dr && dr[0] != '/') {
+        fprintf(stderr, "config: documentroot \"%s\" must be an absolute "
+                "path\n", dr);
+        return NULL;
+    }
     if (dr) {
-        d->path = arena_strdup(a, dr);
+        if (!(d->path = arena_strdup(a, dr))) return NULL;
     } else if (parent && parent->path &&
                !(nm && (strchr(nm, '*') || strchr(nm, '?')))) {
         size_t pl = strlen(parent->path), nl = nm ? strlen(nm) : 0;
@@ -202,11 +285,11 @@ static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
         if (nl) memcpy(p + pl + 1, nm, nl);
         p[pl + nl + 1] = 0;
         d->path = p;
-    } else if (parent) {
+    } else {
         /* glob name (or a child of one): the real filesystem path is
          * derived per request from the matched URL component */
         d->path = NULL;
-    } else d->path = arena_strdup(a, "/");
+    }
 
     /* ---- auth: monotonic ---- */
     json_t *jauth = json_object_get(j, "auth");
@@ -222,19 +305,36 @@ static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
         d->auth_required = 1;
         d->auth_user = arena_strdup(a, au);
         d->auth_pass = arena_strdup(a, ap);
+        if (!d->auth_user || !d->auth_pass) return NULL;
     } else if (parent) {
         d->auth_required = parent->auth_required;
         d->auth_user     = parent->auth_user;
         d->auth_pass     = parent->auth_pass;
     }
 
-    /* ---- ip ACL: intersection ---- */
-    int n_own = 0; Acl *own = parse_acl(a, json_object_get(j, "ip_allow"), &n_own);
-    if (parent && parent->n_allow) {
-        if (!n_own) { d->allow = parent->allow; d->n_allow = parent->n_allow; }
-        else        d->n_allow = acl_intersect(a, parent->allow, parent->n_allow,
-                                              own, n_own, &d->allow);
-    } else { d->allow = own; d->n_allow = n_own; }
+    /* ---- ip ACL: inherited, intersected with the parent's ---- */
+    json_t *jacl = json_object_get(j, "ip_allow");
+    Acl *own = NULL;
+    int n_own = 0;
+    if (jacl && parse_acl(a, jacl, &own, &n_own) < 0) return NULL;
+    if (parent && parent->acl_set) {
+        d->acl_set = 1;
+        if (!jacl) {
+            d->allow = parent->allow;
+            d->n_allow = parent->n_allow;
+        } else if (acl_intersect(a, parent->allow, parent->n_allow,
+                                 own, n_own, &d->allow, &d->n_allow) < 0) {
+            fprintf(stderr, "config: out of memory (ip_allow)\n");
+            return NULL;
+        } else if (d->n_allow == 0) {
+            log_warn("config: ip_allow of \"%s\" does not overlap its "
+                     "parent's: nobody can access it", nm ? nm : "?");
+        }
+    } else if (jacl) {
+        d->acl_set = 1;
+        d->allow = own;
+        d->n_allow = n_own;
+    }
 
     /* ---- timeouts: free ---- */
     d->header_timeout    = j_timeout(j, "header_timeout",
@@ -243,6 +343,8 @@ static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
                                  parent ? parent->body_timeout      : cfg->def_body_timeout);
     d->keepalive_timeout = j_timeout(j, "keepalive_timeout",
                                  parent ? parent->keepalive_timeout : cfg->def_keepalive);
+    d->cgi_timeout       = j_timeout(j, "cgi_timeout",
+                                 parent ? parent->cgi_timeout       : cfg->def_cgi_timeout);
 
     /* ---- cgi: per-directory only, not inherited from the parent ---- */
     json_t *jcgi = json_object_get(j, "cgi");
@@ -253,14 +355,21 @@ static DirCfg *parse_dir(Arena *a, json_t *j, DirCfg *parent,
         for (size_t i = 0; i < nadd; i++) {
             json_t *e = json_array_get(jcgi, i);
             const char *name = j_str(e, "name");
-            if (!name) continue;
+            if (!name || !*name || name[0] == '/') {
+                fprintf(stderr, "config: every cgi entry needs a relative "
+                        "\"name\"\n");
+                return NULL;
+            }
             CgiProgram *slot = &d->cgi[d->n_cgi++];
             memset(slot, 0, sizeof(*slot));
-            slot->name = arena_strdup(a, name);
             const char *pp = j_str(e, "path");
-            slot->path = pp ? arena_strdup(a, pp) : NULL;
             const char *uu = j_str(e, "user");
+            if (!cgi_user_ok(uu ? uu : cfg->cgi_user)) return NULL;
+            slot->name = arena_strdup(a, name);
+            slot->path = pp ? arena_strdup(a, pp) : NULL;
             slot->user = uu ? arena_strdup(a, uu) : NULL;
+            if (!slot->name || (pp && !slot->path) || (uu && !slot->user))
+                return NULL;
         }
     }
 
@@ -325,6 +434,7 @@ Config *config_load(Arena *a, const char *path) {
     if (!root) { fprintf(stderr, "json: %s\n", err.text); return NULL; }
 
     Config *c = arena_alloc(a, sizeof(*c));
+    if (!c) { fprintf(stderr, "config: out of memory\n"); json_decref(root); return NULL; }
     memset(c, 0, sizeof(*c));
     c->httpd_user       = arena_strdup(a, j_str(root, "httpd_user") ? j_str(root, "httpd_user") : "nobody");
     c->cgi_user         = arena_strdup(a, j_str(root, "cgi_user")   ? j_str(root, "cgi_user")   : "nobody");
@@ -335,24 +445,57 @@ Config *config_load(Arena *a, const char *path) {
     c->access_log_owner = arena_strdup(a, j_str(root, "access_log_owner"));
     c->access_log_mode  = j_mode(root, "access_log_mode", -1);
     c->arena_size       = j_int(root, "arena_size", 32u << 20);
+    if (!c->httpd_user || !c->cgi_user ||
+        (j_str(root, "cert_file") && !c->cert_file) ||
+        (j_str(root, "key_file") && !c->key_file) ||
+        (j_str(root, "letsencrypt_root") && !c->letsencrypt_root) ||
+        (j_str(root, "access_log") && !c->access_log) ||
+        (j_str(root, "access_log_owner") && !c->access_log_owner)) {
+        fprintf(stderr, "config: out of memory\n");
+        json_decref(root);
+        return NULL;
+    }
 
     json_t *defs = json_object_get(root, "defaults");
     c->def_header_timeout = j_timeout(defs, "header_timeout", 10);
     c->def_body_timeout   = j_timeout(defs, "body_timeout",   30);
     c->def_keepalive      = j_timeout(defs, "keepalive_timeout", 60);
+    c->def_cgi_timeout    = j_timeout(defs, "cgi_timeout", 30);
 
     /* sites */
     json_t *sites = json_object_get(root, "sites");
     if (json_is_array(sites)) {
         size_t n = json_array_size(sites);
-        c->sites = arena_alloc(a, sizeof(SiteCfg *) * n);
+        c->sites = arena_alloc(a, sizeof(SiteCfg *) * (n ? n : 1));
+        if (!c->sites) {
+            fprintf(stderr, "config: out of memory\n");
+            json_decref(root);
+            return NULL;
+        }
         for (size_t i = 0; i < n; i++) {
             json_t *s = json_array_get(sites, i);
+            const char *sn = j_str(s, "name");
+            if (!sn || !*sn) {
+                fprintf(stderr, "config: every site needs a \"name\"\n");
+                json_decref(root);
+                return NULL;
+            }
             SiteCfg *sc = arena_alloc(a, sizeof(*sc));
+            if (!sc) {
+                fprintf(stderr, "config: out of memory\n");
+                json_decref(root);
+                return NULL;
+            }
             memset(sc, 0, sizeof(*sc));
-            sc->name = arena_strdup(a, j_str(s, "name"));
+            sc->name = arena_strdup(a, sn);
             sc->cert_file = arena_strdup(a, j_str(s, "cert_file"));
             sc->key_file  = arena_strdup(a, j_str(s, "key_file"));
+            if (!sc->name || (j_str(s, "cert_file") && !sc->cert_file) ||
+                (j_str(s, "key_file") && !sc->key_file)) {
+                fprintf(stderr, "config: out of memory\n");
+                json_decref(root);
+                return NULL;
+            }
             sc->root = parse_dir(a, s, NULL, c, NULL);
             if (!sc->root) {
                 json_decref(root);
@@ -552,22 +695,32 @@ static const TlsKey *pick_site_key(const char *sni, void *arg) {
 /* =====================================================================
  * tiny helpers
  * ===================================================================== */
-static int wait_readable(Conn *c, int secs) {
+/* Wait for request data.  The read must finish by the absolute deadline,
+ * each wait is limited to idle_s, and a connection that has been silent
+ * for IDLE_PREEMPT_MS is given up as soon as another client waits. */
+static int conn_wait(Conn *c, int64_t deadline, int idle_s) {
     if (c->tls && tls_pending(c->tls)) return 1;
-    struct pollfd p = { c->fd, POLLIN, 0 };
-    int r = poll(&p, 1, secs * 1000);
-    return r > 0 && (p.revents & POLLIN);
+    int64_t last = c->last_rx;
+    if (c->tls && tls_last_rx(c->tls) > last) last = tls_last_rx(c->tls);
+    return io_wait(c->fd, deadline, idle_s * 1000, c->pre_fd, &last) > 0;
 }
 
 static ssize_t conn_read(Conn *c, void *buf, size_t n) {
-    return c->tls ? tls_read(c->tls, buf, n) : read(c->fd, buf, n);
+    ssize_t r;
+    if (c->tls) r = tls_read(c->tls, buf, n);
+    else do r = read(c->fd, buf, n); while (r < 0 && errno == EINTR);
+    if (r > 0) c->last_rx = mono_ms();
+    return r;
 }
 
+/* the socket has SO_SNDTIMEO set, so a client that stops reading makes
+ * write() fail instead of blocking the server forever */
 static int send_all(Conn *c, const void *buf, size_t n) {
     const char *p = buf;
     while (n) {
         ssize_t w = c->tls ? tls_write(c->tls, p, n) : write(c->fd, p, n);
         if (w < 0) { if (errno == EINTR) continue; return -1; }
+        if (w == 0) return -1;
         c->nbytes += (uint64_t)w;
         p += w; n -= (size_t)w;
     }
@@ -620,16 +773,42 @@ static int b64_decode(const char *in, unsigned char *out, size_t outmax) {
     return (int)o;
 }
 
+/* true if the URL path is absolute and has no "." or ".." segments */
+static int path_is_clean(const char *path) {
+    if (!path || path[0] != '/') return 0;
+    for (const char *p = path; *p; ) {
+        while (*p == '/') p++;
+        const char *e = p;
+        while (*e && *e != '/') e++;
+        size_t l = (size_t)(e - p);
+        if ((l == 1 && p[0] == '.') ||
+            (l == 2 && p[0] == '.' && p[1] == '.')) return 0;
+        p = e;
+    }
+    return 1;
+}
+
 /* =====================================================================
  * HTTP request parser
  * ===================================================================== */
-static char *read_headers(Arena *a, Conn *c, int timeout,
-                          size_t *out_len, size_t *out_extra) {
-    size_t cap = 8192, len = 0, scanned = 0;
+#define MAX_HEADER_BYTES 8192
+
+/* Request bodies and responses must move at no less than this average
+ * rate (bytes/s) on top of the configured timeout.  A deadline per
+ * transfer keeps a trickling client from holding the (single-connection)
+ * server indefinitely while still allowing large transfers. */
+#define MIN_TRANSFER_RATE 32768
+
+/* read up to the blank line ending the header block.  NULL with
+ * *err = -1 on I/O error/timeout, 431 when the block is too large. */
+static char *read_headers(Arena *a, Conn *c, int64_t deadline, int idle_s,
+                          size_t *out_len, size_t *out_extra, int *err) {
+    size_t cap = MAX_HEADER_BYTES, len = 0, scanned = 0;
+    *err = -1;
     char *buf = arena_alloc(a, cap);
     if (!buf) return NULL;
     while (len < cap) {
-        if (!wait_readable(c, timeout)) return NULL;
+        if (!conn_wait(c, deadline, idle_s)) return NULL;
         ssize_t n = conn_read(c, buf + len, cap - len);
         if (n <= 0) return NULL;
         len += (size_t)n;
@@ -649,6 +828,7 @@ static char *read_headers(Arena *a, Conn *c, int timeout,
         }
         scanned = len >= 3 ? len - 3 : 0;
     }
+    *err = 431;
     return NULL;
 }
 
@@ -659,52 +839,136 @@ static char *trim(char *s) {
     return s;
 }
 
+/* Bytes of the request line and header block: CR and LF only as CRLF
+ * pairs, no NUL or other control characters (TAB is allowed).  Bare
+ * LFs would otherwise be copied into log lines or response headers. */
+static int header_bytes_ok(const char *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ch = (unsigned char)p[i];
+        if (ch == '\r') {
+            if (i + 1 >= n || p[i + 1] != '\n') return 0;
+            i++;
+            continue;
+        }
+        if (ch == '\t') continue;
+        if (ch < 0x20 || ch == 0x7f) return 0;
+    }
+    return 1;
+}
+
+static const char TCHARS[] =
+    "!#$%&'*+-.^_`|~0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/* host name or IPv4 address, optionally ":port" */
+static int host_ok(const char *h) {
+    size_t n = strlen(h);
+    if (n == 0 || n > 255) return 0;
+    const char *colon = strchr(h, ':');
+    size_t nl = colon ? (size_t)(colon - h) : n;
+    if (nl == 0 || strspn(h, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                             "abcdefghijklmnopqrstuvwxyz0123456789.-") != nl)
+        return 0;
+    if (colon) {
+        size_t pl = strlen(colon + 1);
+        if (pl < 1 || pl > 5 || strspn(colon + 1, "0123456789") != pl)
+            return 0;
+    }
+    return 1;
+}
+
+/* true if a comma-separated header value contains token tok */
+static int has_token(const char *v, const char *tok) {
+    size_t tl = strlen(tok);
+    while (*v) {
+        while (*v == ' ' || *v == '\t' || *v == ',') v++;
+        const char *e = v;
+        while (*e && *e != ',') e++;
+        const char *t = e;
+        while (t > v && (t[-1] == ' ' || t[-1] == '\t')) t--;
+        if ((size_t)(t - v) == tl && !strncasecmp(v, tok, tl)) return 1;
+        v = e;
+    }
+    return 0;
+}
+
 int http_read_request(Arena *a, Conn *c, HttpRequest *r,
                       int hdr_timeout, int body_timeout) {
     memset(r, 0, sizeof(*r));
+    /* the whole header block must arrive within hdr_timeout */
+    int64_t deadline = mono_ms() + (int64_t)hdr_timeout * 1000;
+    if (c->tls) tls_set_deadline(c->tls, deadline);
     size_t hlen, extra;
-    char *raw = read_headers(a, c, hdr_timeout, &hlen, &extra);
-    if (!raw) return -1;
+    int err;
+    char *raw = read_headers(a, c, deadline, hdr_timeout, &hlen, &extra, &err);
+    if (!raw) return err;
+    if (!header_bytes_ok(raw, hlen + 2)) return 400;
 
+    /* request line: METHOD SP target SP HTTP/1.1 */
     char *nl = strstr(raw, "\r\n");
-    if (!nl) return -1;
+    if (!nl) return 400;
     *nl = 0;
-    char *save = NULL;
-    r->method  = strtok_r(raw, " ", &save);
-    r->path    = strtok_r(NULL, " ", &save);
-    r->version = strtok_r(NULL, " ", &save);
-    if (!r->method || !r->path || !r->version) return -1;
-    if (strcmp(r->version, "HTTP/1.1") != 0) return -1;
+    char *sp1 = strchr(raw, ' ');
+    if (!sp1) return 400;
+    *sp1 = 0;
+    char *target = sp1 + 1;
+    char *sp2 = strchr(target, ' ');
+    if (!sp2) return 400;
+    *sp2 = 0;
+    r->method  = raw;
+    r->path    = target;
+    r->version = sp2 + 1;
+    size_t ml = strlen(raw);
+    if (ml < 1 || ml > 16 || strspn(raw, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") != ml)
+        return 400;
+    if (!*target) return 400;
+    for (const char *p = target; *p; p++)
+        if ((unsigned char)*p <= 0x20 || (unsigned char)*p >= 0x7f) return 400;
+    if (strcmp(r->version, "HTTP/1.1") != 0) return 505;
 
     char *q = strchr(r->path, '?');
     if (q) { *q = 0; r->query = q + 1; }
     r->keep_alive = 1;
 
     /* headers */
+    int have_cl = 0;
     char *cur = nl + 2;
     while (*cur) {
         char *eol = strstr(cur, "\r\n");
-        if (!eol) break;
+        if (!eol) return 400;
         *eol = 0;
+        if (*cur == ' ' || *cur == '\t') return 400;      /* obsolete folding */
         char *colon = strchr(cur, ':');
-        if (colon) {
-            *colon = 0;
-            char *v = trim(colon + 1);
-            if      (!strcasecmp(cur, "Host"))           r->host = v;
-            else if (!strcasecmp(cur, "Authorization"))  r->authorization = v;
-            else if (!strcasecmp(cur, "Content-Length")) r->content_length = atol(v);
-            else if (!strcasecmp(cur, "Connection")) {
-                if (!strcasecmp(v, "close")) r->keep_alive = 0;
-            }
+        if (!colon || colon == cur) return 400;
+        *colon = 0;
+        if (strspn(cur, TCHARS) != strlen(cur)) return 400;
+        char *v = trim(colon + 1);
+        if (!strcasecmp(cur, "Host")) {
+            if (r->host || !host_ok(v)) return 400;
+            r->host = v;
+        } else if (!strcasecmp(cur, "Authorization")) {
+            if (r->authorization) return 400;
+            r->authorization = v;
+        } else if (!strcasecmp(cur, "Content-Length")) {
+            size_t vl = strlen(v);
+            if (have_cl || vl < 1 || vl > 18 ||
+                strspn(v, "0123456789") != vl) return 400;
+            r->content_length = strtol(v, NULL, 10);
+            have_cl = 1;
+        } else if (!strcasecmp(cur, "Transfer-Encoding")) {
+            return 501;                    /* chunked bodies: not supported */
+        } else if (!strcasecmp(cur, "Connection")) {
+            if (has_token(v, "close")) r->keep_alive = 0;
         }
         cur = eol + 2;
     }
+    if (!r->host) return 400;              /* mandatory in HTTP/1.1 */
 
     /* body */
     if (r->content_length > 0) {
-        if (r->content_length > (long)(a->size - a->used)) return -1;
+        if (r->content_length > (long)(a->size - a->used)) return 413;
         r->body = arena_alloc(a, (size_t)r->content_length + 1);
-        if (!r->body) return -1;
+        if (!r->body) return 413;
         size_t got = 0;
         /* bytes read_headers() consumed beyond the header belong to the body */
         if (extra) {
@@ -718,8 +982,11 @@ int http_read_request(Arena *a, Conn *c, HttpRequest *r,
             memcpy(r->body, raw + hlen + 4, extra);
             got = extra;
         }
+        int64_t bdeadline = mono_ms() +
+            ((int64_t)body_timeout + r->content_length / MIN_TRANSFER_RATE) * 1000;
+        if (c->tls) tls_set_deadline(c->tls, bdeadline);
         while (got < (size_t)r->content_length) {
-            if (!wait_readable(c, body_timeout)) return -1;
+            if (!conn_wait(c, bdeadline, body_timeout)) return -1;
             ssize_t n = conn_read(c, r->body + got, (size_t)r->content_length - got);
             if (n <= 0) return -1;
             got += (size_t)n;
@@ -732,20 +999,22 @@ int http_read_request(Arena *a, Conn *c, HttpRequest *r,
         if (!c->tls) return -1;
         tls_unread(c->tls, raw + hlen + 4, extra);
     }
+    if (c->tls) tls_set_deadline(c->tls, 0);
     return 0;
 }
 
-int http_send_simple(Conn *c, int code, const char *reason,
-                     const char *extra, const char *body,
-                     size_t body_len, int head_only) {
-    char hdr[2048];
+static int send_simple(Conn *c, int code, const char *reason,
+                       const char *extra, const char *body,
+                       size_t body_len, int head_only, int close_conn) {
+    char hdr[MAX_HEADER_BYTES + 1024];
     int n = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 %d %s\r\n"
         "Server: corehttpd\r\n"
         "Content-Length: %zu\r\n"
-        "Connection: keep-alive\r\n"
+        "Connection: %s\r\n"
         "%s"
-        "\r\n", code, reason, body_len, extra ? extra : "");
+        "\r\n", code, reason, body_len, close_conn ? "close" : "keep-alive",
+        extra ? extra : "");
     if (n < 0 || (size_t)n >= sizeof(hdr)) return -1;
     if (send_all(c, hdr, (size_t)n) < 0) return -1;
     if (!head_only && body && body_len) {
@@ -754,40 +1023,88 @@ int http_send_simple(Conn *c, int code, const char *reason,
     return 0;
 }
 
+int http_send_simple(Conn *c, int code, const char *reason,
+                     const char *extra, const char *body,
+                     size_t body_len, int head_only) {
+    return send_simple(c, code, reason, extra, body, body_len, head_only, 0);
+}
+
+static const char *status_reason(int code) {
+    switch (code) {
+    case 400: return "Bad Request";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 413: return "Payload Too Large";
+    case 414: return "URI Too Long";
+    case 429: return "Too Many Requests";
+    case 431: return "Request Header Fields Too Large";
+    case 500: return "Internal Server Error";
+    case 501: return "Not Implemented";
+    case 502: return "Bad Gateway";
+    case 505: return "HTTP Version Not Supported";
+    default:  return "Error";
+    }
+}
+
+/* error response after which the connection is closed */
+static void send_error_close(Conn *c, int code, int head_only) {
+    char body[64];
+    int bl = snprintf(body, sizeof body, "%d %s\n", code, status_reason(code));
+    send_simple(c, code, status_reason(code), NULL, body, (size_t)bl,
+                head_only, 1);
+}
+
 /* =====================================================================
- * CGI wire protocol (httpd <-> cgi)
+ * CGI wire protocol (httpd <-> cgi broker)
+ *
+ * The httpd sends only the request (method, site, URL, query, body);
+ * the broker resolves the program and user from its own copy of the
+ * configuration.  The response comes back as frames: uint32 length +
+ * data, a zero length ends it.
  * ===================================================================== */
-struct CgiHdr {
-    uint32_t prog_len;
-    uint32_t user_len;
-    uint32_t nenv;
-    uint32_t body_len;
+#define CGI_MAX_BODY  (16u << 20)
+#define CGI_MAX_FIELD MAX_HEADER_BYTES
+
+struct CgiReq {
+    uint32_t method_len, host_len, path_len, query_len, body_len;
 };
 
-static int cgi_dispatch(Arena *a, int cgi_fd,
-                        const char *prog, const char *user,
-                        char *const *env, int nenv,
-                        const void *body, size_t body_len) {
-    (void)a;
-    struct CgiHdr h = {
-        .prog_len = (uint32_t)strlen(prog),
-        .user_len = (uint32_t)strlen(user),
-        .nenv     = (uint32_t)nenv,
-        .body_len = (uint32_t)body_len,
+static int cgi_send_request(int fd, const char *method, const char *host,
+                            const char *path, const char *query,
+                            const void *body, size_t body_len) {
+    struct CgiReq h = {
+        .method_len = (uint32_t)strlen(method),
+        .host_len   = (uint32_t)strlen(host),
+        .path_len   = (uint32_t)strlen(path),
+        .query_len  = query ? (uint32_t)strlen(query) : 0,
+        .body_len   = (uint32_t)body_len,
     };
-    if (send_fd_all(cgi_fd, &h, sizeof(h)) < 0) return -1;
-    if (send_fd_all(cgi_fd, prog, h.prog_len) < 0) return -1;
-    if (send_fd_all(cgi_fd, user, h.user_len) < 0) return -1;
-    for (int i = 0; i < nenv; i++) {
-        const char *e = env[i];
-        const char *eq = strchr(e, '=');
-        uint32_t kl = eq ? (uint32_t)(eq - e) : (uint32_t)strlen(e);
-        uint32_t vl = eq ? (uint32_t)strlen(eq + 1) : 0;
-        send_fd_all(cgi_fd, &kl, 4); send_fd_all(cgi_fd, &vl, 4);
-        send_fd_all(cgi_fd, e, kl);
-        if (vl) send_fd_all(cgi_fd, eq + 1, vl);
+    if (send_fd_all(fd, &h, sizeof h) < 0 ||
+        send_fd_all(fd, method, h.method_len) < 0 ||
+        send_fd_all(fd, host, h.host_len) < 0 ||
+        send_fd_all(fd, path, h.path_len) < 0 ||
+        (h.query_len && send_fd_all(fd, query, h.query_len) < 0) ||
+        (body_len && send_fd_all(fd, body, body_len) < 0))
+        return -1;
+    return 0;
+}
+
+/* read exactly n bytes before the deadline */
+static int read_full_deadline(int fd, void *buf, size_t n, int64_t deadline) {
+    char *p = buf;
+    while (n) {
+        int64_t rem = deadline - mono_ms();
+        if (rem <= 0) return -1;
+        struct pollfd pf = { fd, POLLIN, 0 };
+        int r = poll(&pf, 1, (int)rem);
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) return -1;
+        ssize_t k = read(fd, p, n);
+        if (k < 0) { if (errno == EINTR || errno == EAGAIN) continue; return -1; }
+        if (k == 0) return -1;
+        p += k;
+        n -= (size_t)k;
     }
-    if (body_len) send_fd_all(cgi_fd, body, body_len);
     return 0;
 }
 
@@ -798,81 +1115,113 @@ struct SrvCtx {
     Config  *cfg;
     Arena   *arena;
     int      srv80, srv443;
-    int      cgi_fd;
+    int      cgi_fd;             /* -1 once the broker channel broke */
     int      log_fd;             /* access-log lines go to the master */
     int      stop;
 };
 
 static int ip_allowed(DirCfg *d, struct sockaddr_in *peer) {
-    if (d->n_allow == 0) return 1;
+    if (!d->acl_set) return 1;
     uint32_t ip = ntohl(peer->sin_addr.s_addr);
     for (int i = 0; i < d->n_allow; i++)
         if ((ip & d->allow[i].mask) == d->allow[i].net) return 1;
-    return 0;
+    return 0;                  /* includes an empty (no-overlap) list */
 }
 
-/* constant-time string comparison (no early exit on mismatch) */
-static int ct_eq(const char *a, const char *b) {
-    size_t la = strlen(a), lb = strlen(b);
-    size_t n = la > lb ? la : lb;
+/* Constant-time comparison of a client-supplied string with a configured
+ * secret.  The loop always runs over the whole secret, so the time
+ * depends neither on where the strings differ nor on the secret's
+ * length relative to the input. */
+static int ct_eq(const char *given, const char *secret) {
+    size_t lg = strlen(given), ls = strlen(secret);
     unsigned char d = 0;
-    for (size_t i = 0; i < n; i++) {
-        unsigned char ca = i < la ? (unsigned char)a[i] : 0;
-        unsigned char cb = i < lb ? (unsigned char)b[i] : 0;
-        d |= (unsigned char)(ca ^ cb);
+    for (size_t i = 0; i < ls; i++) {
+        unsigned char g = i < lg ? (unsigned char)given[i] : 0;
+        d |= (unsigned char)(g ^ (unsigned char)secret[i]);
     }
-    return d == 0;
+    return (d == 0) & (lg == ls);
 }
 
 static int auth_check(DirCfg *d, const char *hdr) {
     if (!d->auth_required) return 1;
     if (!hdr || strncasecmp(hdr, "Basic ", 6) != 0) return 0;
     unsigned char dec[512];
+    int ok = 0;
     int n = b64_decode(hdr + 6, dec, sizeof(dec) - 1);
-    if (n <= 0) return 0;
-    dec[n] = 0;
-    char *colon = strchr((char*)dec, ':');
-    if (!colon) return 0;
-    *colon = 0;
-    return ct_eq((char*)dec, d->auth_user) && ct_eq(colon + 1, d->auth_pass);
-}
-
-/* true if the URL path is absolute and has no "." or ".." segments */
-static int path_is_clean(const char *path) {
-    if (!path || path[0] != '/') return 0;
-    for (const char *p = path; *p; ) {
-        while (*p == '/') p++;
-        const char *e = p;
-        while (*e && *e != '/') e++;
-        size_t l = (size_t)(e - p);
-        if ((l == 1 && p[0] == '.') ||
-            (l == 2 && p[0] == '.' && p[1] == '.')) return 0;
-        p = e;
+    if (n > 0) {
+        dec[n] = 0;
+        char *colon = strchr((char*)dec, ':');
+        if (colon) {
+            *colon = 0;
+            /* always compare both, so the time does not reveal whether
+             * the user name was right */
+            ok = ct_eq((char*)dec, d->auth_user) & ct_eq(colon + 1, d->auth_pass);
+        }
     }
-    return 1;
+    explicit_bzero(dec, sizeof dec);
+    return ok;
 }
 
-/* true if path, after symlink resolution, stays inside root */
-static int path_within_root(const char *root, const char *path) {
-    char rr[PATH_MAX], rp[PATH_MAX];
-    if (!realpath(root, rr)) return 0;
-    if (!realpath(path, rp)) return 0;
-    size_t n = strlen(rr);
-    return strncmp(rp, rr, n) == 0 && (rp[n] == 0 || rp[n] == '/');
+/* Failed Basic-auth attempts per client IP: after AUTHFAIL_MAX failures
+ * within AUTHFAIL_WINDOW_MS the client gets 429 for protected paths
+ * until the window ends.  A small fixed table; a colliding IP evicts
+ * an older entry. */
+#define AUTHFAIL_SLOTS     256
+#define AUTHFAIL_MAX       10
+#define AUTHFAIL_WINDOW_MS (60 * 1000)
+static struct { uint32_t ip; int fails; int64_t start; } g_authfail[AUTHFAIL_SLOTS];
+
+static unsigned authfail_slot(uint32_t ip) {
+    return (ip * 2654435761u) >> 24;                /* 0..255 */
 }
 
-/* Serve a static file (index.html if dir). */
+static int authfail_blocked(uint32_t ip) {
+    unsigned s = authfail_slot(ip);
+    return g_authfail[s].ip == ip && g_authfail[s].fails >= AUTHFAIL_MAX &&
+           mono_ms() - g_authfail[s].start < AUTHFAIL_WINDOW_MS;
+}
+
+static void authfail_note(uint32_t ip, int failed) {
+    unsigned s = authfail_slot(ip);
+    int64_t now = mono_ms();
+    if (!failed) {
+        if (g_authfail[s].ip == ip) g_authfail[s].fails = 0;
+        return;
+    }
+    if (g_authfail[s].ip != ip || now - g_authfail[s].start >= AUTHFAIL_WINDOW_MS) {
+        g_authfail[s].ip = ip;
+        g_authfail[s].fails = 0;
+        g_authfail[s].start = now;
+    }
+    g_authfail[s].fails++;
+}
+
+static int path_prefix(const char *root, const char *p) {
+    size_t n = strlen(root);
+    if (n == 1 && root[0] == '/') return 1;
+    return strncmp(p, root, n) == 0 && (p[n] == 0 || p[n] == '/');
+}
+
+/* Serve a regular file under root.  The file is opened first and the
+ * check is made on the opened file (its resolved path must be inside
+ * root and name the same inode), so swapping a symlink between check
+ * and open does not help.  Returns 0 when served, -1 before anything
+ * was sent (errno set), -2 when the response was cut short (the
+ * connection must be closed). */
 static int serve_file(Conn *c, const char *root, const char *fullpath,
-                      int head_only) {
-    struct stat st;
-    if (stat(fullpath, &st) < 0) return -1;
-    if (!S_ISREG(st.st_mode)) return -1;
-    if (!path_within_root(root, fullpath)) {
-        errno = EACCES;      /* resolved outside the root: forbidden */
+                      int head_only, int send_timeout) {
+    int f = open(fullpath, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+    if (f < 0) return -1;
+    struct stat st, st2;
+    char rr[PATH_MAX], rp[PATH_MAX];
+    if (fstat(f, &st) < 0) { int e = errno; close(f); errno = e; return -1; }
+    if (!S_ISREG(st.st_mode)) { close(f); errno = ENOENT; return -1; }
+    if (!realpath(root, rr) || !realpath(fullpath, rp) || !path_prefix(rr, rp) ||
+        stat(rp, &st2) < 0 || st2.st_dev != st.st_dev || st2.st_ino != st.st_ino) {
+        close(f);
+        errno = EACCES;      /* resolves outside the root (or raced): forbidden */
         return -1;
     }
-    int f = open(fullpath, O_RDONLY | O_NOFOLLOW);
-    if (f < 0) return -1;
 
     const char *ext = strrchr(fullpath, '.');
     const char *ct = "application/octet-stream";
@@ -895,67 +1244,168 @@ static int serve_file(Conn *c, const char *root, const char *fullpath,
         "Connection: keep-alive\r\n\r\n",
         ct, (long long)st.st_size);
     if (n < 0 || (size_t)n >= sizeof(hdr)) { close(f); return -1; }
-    if (send_all(c, hdr, (size_t)n) < 0) { close(f); return -1; }
+    if (send_all(c, hdr, (size_t)n) < 0) { close(f); return -2; }
     if (!head_only) {
-        char buf[65536]; ssize_t r;
-        while ((r = read(f, buf, sizeof(buf))) > 0)
-            if (send_all(c, buf, (size_t)r) < 0) break;
+        /* send exactly st_size bytes (the announced length), at no less
+         * than MIN_TRANSFER_RATE on average */
+        int64_t deadline = mono_ms() +
+            ((int64_t)send_timeout + st.st_size / MIN_TRANSFER_RATE) * 1000;
+        char buf[65536];
+        off_t left = st.st_size;
+        while (left > 0) {
+            if (mono_ms() > deadline) { close(f); return -2; }
+            size_t want = left < (off_t)sizeof buf ? (size_t)left : sizeof buf;
+            ssize_t r = read(f, buf, want);
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) { close(f); return -2; }      /* file shrank */
+            if (send_all(c, buf, (size_t)r) < 0) { close(f); return -2; }
+            left -= r;
+        }
     }
     close(f);
     return 0;
 }
 
-/* forward raw CGI output from cgi_fd to client; returns the status code */
-static int relay_cgi(Conn *c, int cgi_fd, int head_only) {
-    char buf[65536];
-    int in_body = 0;
-    int status = 200;
-    size_t hdr_len = 0;
-    char hdrbuf[8192];
-    while (1) {
-        ssize_t r = read(cgi_fd, buf, sizeof(buf));
-        if (r <= 0) break;
-        if (!in_body) {
-            size_t csz = (size_t)r;
-            if (hdr_len + csz >= sizeof(hdrbuf)) csz = sizeof(hdrbuf) - hdr_len - 1;
-            memcpy(hdrbuf + hdr_len, buf, csz);
-            hdr_len += csz;
-            hdrbuf[hdr_len] = 0;
-            char *e = strstr(hdrbuf, "\r\n\r\n");
-            if (e) {
-                /* honour a "Status:" header from the CGI program */
-                char *line = hdrbuf;
-                while (line < e) {
-                    char *nl = strstr(line, "\r\n");
-                    if (!nl) break;
-                    if (!strncasecmp(line, "Status:", 7)) {
-                        char st[256] = "200 OK";
-                        const char *v = line + 7;
-                        while (*v == ' ' || *v == '\t') v++;
-                        size_t l = (size_t)(nl - v);
-                        if (l >= sizeof st) l = sizeof st - 1;
-                        memcpy(st, v, l);
-                        st[l] = 0;
-                        char *s = trim(st);
-                        status = atoi(s);
-                        if (head_only) {
-                            char h[1024];
-                            int hn = snprintf(h, sizeof(h),
-                                "HTTP/1.1 %s\r\nServer: corehttpd\r\n"
-                                "Connection: keep-alive\r\n\r\n", s);
-                            if (hn < 0 || (size_t)hn >= sizeof(h)) return 502;
-                            send_all(c, h, (size_t)hn);
-                        }
-                        break;
-                    }
-                    line = nl + 2;
-                }
-                in_body = 1;
+/* Convert a CGI header block (lines ended by LF or CRLF) into an HTTP/1.1
+ * response head.  "Status:" sets the status line (a "Location:" without
+ * it means 302); "Connection:" is replaced, since the response is not
+ * length-delimited and the connection is closed after it.  Returns the
+ * length written to out, or -1 for malformed output. */
+static int cgi_build_head(const char *h, size_t hl, char *out, size_t cap,
+                          int *status) {
+    char st[128] = "200 OK";
+    int has_status = 0, has_location = 0;
+    size_t lines_len = 0;
+    char lines[8192];
+    *status = 200;
+    for (size_t i = 0; i < hl; ) {
+        size_t e = i;
+        while (e < hl && h[e] != '\n') e++;
+        size_t le = e;
+        if (le > i && h[le - 1] == '\r') le--;
+        size_t ll = le - i;
+        const char *line = h + i;
+        i = e + 1;
+        if (ll == 0) continue;
+        for (size_t k = 0; k < ll; k++) {
+            unsigned char ch = (unsigned char)line[k];
+            if ((ch < 0x20 && ch != '\t') || ch == 0x7f) return -1;
+        }
+        const char *colon = memchr(line, ':', ll);
+        if (!colon || colon == line) return -1;
+        size_t nlen = (size_t)(colon - line);
+        if (nlen == 6 && !strncasecmp(line, "Status", 6)) {
+            const char *v = colon + 1;
+            while (v < line + ll && (*v == ' ' || *v == '\t')) v++;
+            size_t vl = (size_t)(line + ll - v);
+            if (vl < 3 || vl >= sizeof st || v[0] < '1' || v[0] > '5' ||
+                v[1] < '0' || v[1] > '9' || v[2] < '0' || v[2] > '9' ||
+                (vl > 3 && v[3] != ' '))
+                return -1;
+            memcpy(st, v, vl);
+            st[vl] = 0;
+            *status = (v[0] - '0') * 100 + (v[1] - '0') * 10 + (v[2] - '0');
+            has_status = 1;
+            continue;
+        }
+        if (nlen == 10 && !strncasecmp(line, "Connection", 10)) continue;
+        if (nlen == 8 && !strncasecmp(line, "Location", 8)) has_location = 1;
+        if (lines_len + ll + 2 > sizeof lines) return -1;
+        memcpy(lines + lines_len, line, ll);
+        lines_len += ll;
+        lines[lines_len++] = '\r';
+        lines[lines_len++] = '\n';
+    }
+    if (!has_status && has_location) {
+        snprintf(st, sizeof st, "302 Found");
+        *status = 302;
+    }
+    int n = snprintf(out, cap, "HTTP/1.1 %s\r\nServer: corehttpd\r\n"
+                     "Connection: close\r\n%.*s\r\n",
+                     st, (int)lines_len, lines);
+    if (n < 0 || (size_t)n >= cap) return -1;
+    return n;
+}
+
+/* find the end of a CGI header block: "\n\n" or "\n\r\n"; *body = offset
+ * of the first body byte */
+static int cgi_header_end(const char *h, size_t hl, size_t *hdr_len,
+                          size_t *body) {
+    for (size_t i = 0; i + 1 < hl; i++) {
+        if (h[i] != '\n') continue;
+        if (h[i + 1] == '\n') { *hdr_len = i + 1; *body = i + 2; return 1; }
+        if (h[i + 1] == '\r' && i + 2 < hl && h[i + 2] == '\n') {
+            *hdr_len = i + 1; *body = i + 3; return 1;
+        }
+    }
+    return 0;
+}
+
+/* Relay one CGI response from the broker.  Frames are always drained up
+ * to the end marker, even after the client went away, so the channel
+ * stays in sync.  *sent: something reached the client; *chan_ok = 0
+ * when the broker channel broke (timeout, protocol error).  Returns the
+ * HTTP status. */
+static int relay_cgi(Conn *c, int cgi_fd, int head_only, int cgi_timeout,
+                     int send_timeout, int *sent, int *chan_ok) {
+    static char buf[65536];
+    char hdr[8192];
+    size_t hl = 0;
+    int state = 0;             /* 0 = CGI headers, 1 = body, 2 = NPH */
+    int status = 502, client_ok = 1;
+    int64_t start = mono_ms();
+    int64_t client_deadline = start + (int64_t)(cgi_timeout + 5) * 1000;
+    int64_t hard_deadline = start +
+        (int64_t)(cgi_timeout + send_timeout + 15) * 1000;
+    *sent = 0;
+    *chan_ok = 1;
+    for (;;) {
+        uint32_t len;
+        if (read_full_deadline(cgi_fd, &len, 4, hard_deadline) < 0 ||
+            len > sizeof buf ||
+            (len && read_full_deadline(cgi_fd, buf, len, hard_deadline) < 0)) {
+            *chan_ok = 0;
+            break;
+        }
+        if (len == 0) break;                           /* end of response */
+        if (!client_ok) continue;                      /* keep draining */
+        if (mono_ms() > client_deadline) { client_ok = 0; continue; }
+
+        if (state == 0) {
+            size_t room = sizeof hdr - 1 - hl;
+            size_t take = len < room ? len : room;
+            memcpy(hdr + hl, buf, take);
+            hl += take;
+            hdr[hl] = 0;
+            if (hl >= 5 && !memcmp(hdr, "HTTP/", 5)) {
+                /* non-parsed-header CGI: pass the output through */
+                state = 2;
+                status = hl >= 12 ? atoi(hdr + 9) : 200;
+                client_ok = send_all(c, hdr, hl) == 0 &&
+                            (take == len || send_all(c, buf + take, len - take) == 0);
+                *sent = 1;
+                continue;
             }
+            size_t hlen, body;
+            if (!cgi_header_end(hdr, hl, &hlen, &body)) {
+                if (hl == sizeof hdr - 1) client_ok = 0;   /* header too large */
+                continue;
+            }
+            char head[sizeof hdr + 256];
+            int n = cgi_build_head(hdr, hlen, head, sizeof head, &status);
+            if (n < 0) { status = 502; client_ok = 0; continue; }
+            state = 1;
+            *sent = 1;
+            client_ok = send_all(c, head, (size_t)n) == 0;
+            if (client_ok && !head_only) {
+                if (hl > body) client_ok = send_all(c, hdr + body, hl - body) == 0;
+                if (client_ok && take < len)
+                    client_ok = send_all(c, buf + take, len - take) == 0;
+            }
+            continue;
         }
-        if (!head_only) {
-            if (send_all(c, buf, (size_t)r) < 0) break;
-        }
+        if (state == 1 && head_only) continue;
+        client_ok = send_all(c, buf, len) == 0;
     }
     return status;
 }
@@ -1000,6 +1450,21 @@ static char *arena_sprintf(Arena *a, const char *fmt, ...) {
     return p;
 }
 
+/* append s to the log line, escaping control characters, '"', '\' and
+ * non-ASCII bytes as \xHH so a request cannot forge or break log lines */
+static void log_append(char *line, size_t cap, size_t *n, const char *s) {
+    for (; *s && *n + 5 < cap; s++) {
+        unsigned char ch = (unsigned char)*s;
+        if (ch < 0x20 || ch >= 0x7f || ch == '"' || ch == '\\') {
+            snprintf(line + *n, cap - *n, "\\x%02x", ch);
+            *n += 4;
+        } else {
+            line[(*n)++] = (char)ch;
+        }
+    }
+    line[*n] = 0;
+}
+
 /* Build one Apache-style access-log line and ship it to the master
  * (which writes it to disk). */
 static void access_log_request(struct SrvCtx *ctx,
@@ -1016,23 +1481,28 @@ static void access_log_request(struct SrvCtx *ctx,
     char ts[64];
     strftime(ts, sizeof ts, "%d/%b/%Y:%H:%M:%S %z", &tm);
     char line[2048];
-    int n = snprintf(line, sizeof line,
-        "%s - %s [%s] \"%s %s%s%s %s\" %d %llu\n",
-        ip,
-        auth_user ? auth_user : "-",
-        ts,
-        req->method ? req->method : "-",
-        req->path ? req->path : "-",
-        req->query && *req->query ? "?" : "",
-        req->query ? req->query : "",
-        req->version ? req->version : "-",
-        status, (unsigned long long)nbytes);
-    if (n < 0) return;
-    if (n >= (int)sizeof line) {
-        n = (int)sizeof line - 1;
-        line[n - 1] = '\n';    /* keep lines intact when truncated */
+    const size_t cap = sizeof line - 48;   /* room for status, bytes, \n */
+    size_t n = 0;
+    log_append(line, cap, &n, ip);
+    log_append(line, cap, &n, " - ");
+    log_append(line, cap, &n, auth_user ? auth_user : "-");
+    log_append(line, cap, &n, " [");
+    log_append(line, cap, &n, ts);
+    log_append(line, cap, &n, "] ");
+    if (n + 1 < cap) line[n++] = '"';
+    log_append(line, cap, &n, req->method ? req->method : "-");
+    log_append(line, cap, &n, " ");
+    log_append(line, cap, &n, req->path ? req->path : "-");
+    if (req->query && *req->query) {
+        log_append(line, cap, &n, "?");
+        log_append(line, cap, &n, req->query);
     }
-    send_fd_all(ctx->log_fd, line, (size_t)n);
+    log_append(line, cap, &n, " ");
+    log_append(line, cap, &n, req->version ? req->version : "-");
+    int k = snprintf(line + n, sizeof line - n, "\" %d %llu\n",
+                     status, (unsigned long long)nbytes);
+    if (k < 0) return;
+    send_fd_all(ctx->log_fd, line, n + (size_t)k);
 }
 
 /* wait for the next request on a keep-alive connection.  Returns 1 when
@@ -1052,18 +1522,28 @@ static int wait_keepalive(struct SrvCtx *ctx, Conn *c, int secs) {
     return -1;                            /* new connection pending */
 }
 
-/* Main per‑connection handler. */
+/* Main per-connection handler. */
 static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
     struct sockaddr_in peer; socklen_t pl = sizeof(peer);
+    memset(&peer, 0, sizeof peer);
     getpeername(fd, (struct sockaddr *)&peer, &pl);
     char ip[INET_ADDRSTRLEN] = "-";
     inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
+    uint32_t ip_u32 = ntohl(peer.sin_addr.s_addr);
+    const Config *cfg = ctx->cfg;
 
-    Conn conn = { fd, NULL, 0 };
+    /* a client that stops reading cannot stall a write for longer than
+     * the body timeout */
+    struct timeval tv = { .tv_sec = cfg->def_body_timeout, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
+    Conn conn = { .fd = fd, .tls = NULL, .nbytes = 0,
+                  .pre_fd = { ctx->srv80, ctx->srv443 },
+                  .last_rx = mono_ms() };
     if (is_tls) {
-        conn.tls = tls_server_handshake(ctx->arena, fd, ctx->cfg->tls_key,
+        conn.tls = tls_server_handshake(ctx->arena, fd, cfg->tls_key,
                                         pick_site_key, ctx->cfg,
-                                        ctx->cfg->def_header_timeout);
+                                        cfg->def_header_timeout, conn.pre_fd);
         if (!conn.tls) {
             log_warn("TLS handshake failed (client %s)", ip);
             close(fd);
@@ -1078,7 +1558,7 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
         if (!first) {
             /* keep-alive: wait for the next request, but let new
              * connections preempt the idle one */
-            if (wait_keepalive(ctx, &conn, ctx->cfg->def_header_timeout) <= 0)
+            if (wait_keepalive(ctx, &conn, cfg->def_header_timeout) <= 0)
                 break;
         }
         first = 0;
@@ -1089,10 +1569,19 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
 
         HttpRequest req;
         int r = http_read_request(ctx->arena, &conn, &req,
-                                  ctx->cfg->def_header_timeout,
-                                  ctx->cfg->def_body_timeout);
+                                  cfg->def_header_timeout,
+                                  cfg->def_body_timeout);
         if (r < 0) {
             log_debug("client %s: request read failed or timed out", ip);
+            break;
+        }
+        int head_only = req.method && !strcmp(req.method, "HEAD");
+        if (r > 0) {
+            /* malformed request: answer and close */
+            status = r;
+            send_error_close(&conn, status, head_only);
+            access_log_request(ctx, &peer, &req, NULL, status,
+                               conn.nbytes - bytes0);
             break;
         }
 
@@ -1101,8 +1590,7 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
          * "/./.git/config").  Refuse them, and anything not absolute. */
         if (!path_is_clean(req.path)) {
             status = 400;
-            http_send_simple(&conn, 400, "Bad Request", NULL,
-                             "bad path\n", 9, !strcmp(req.method, "HEAD"));
+            send_error_close(&conn, status, head_only);
             access_log_request(ctx, &peer, &req, NULL, status,
                                conn.nbytes - bytes0);
             break;
@@ -1111,7 +1599,7 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
         SiteCfg *site = config_find_site(ctx->cfg, req.host);
         if (!site) {
             status = 404;
-            http_send_simple(&conn, 404, "Not Found", NULL, "no site", 7, 0);
+            send_error_close(&conn, status, head_only);
             access_log_request(ctx, &peer, &req, NULL, status,
                                conn.nbytes - bytes0);
             break;
@@ -1119,19 +1607,18 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
 
         /* mutate a scratch copy of the path for walking */
         char *path_scratch = arena_strdup(ctx->arena, req.path);
-        int head_only = !strcmp(req.method, "HEAD");
         char *rest = NULL;
         char fs_path[2048];
-        DirCfg *eff = config_walk(site->root, path_scratch, &rest,
-                                  fs_path, sizeof fs_path);
+        DirCfg *eff = path_scratch
+                    ? config_walk(site->root, path_scratch, &rest,
+                                  fs_path, sizeof fs_path)
+                    : NULL;
         if (!eff) {
-            status = 414;
-            http_send_simple(&conn, 414, "URI Too Long", NULL,
-                             "uri too long\n", 13, head_only);
+            status = path_scratch ? 414 : 500;
+            send_error_close(&conn, status, head_only);
             access_log_request(ctx, &peer, &req, NULL, status,
                                conn.nbytes - bytes0);
-            if (!req.keep_alive) break;
-            continue;
+            break;
         }
 
         /* ---- port 80: redirect / letsencrypt / GET-HEAD only ---- */
@@ -1143,30 +1630,48 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
                 access_log_request(ctx, &peer, &req, NULL, status,
                                    conn.nbytes - bytes0);
                 if (!req.keep_alive) break;
-		continue;
+                continue;
             }
-            if (req.path && !strncmp(req.path, "/.well-known/acme-challenge/", 28)) {
-                char full[1024];
-                const char *le_root = ctx->cfg->letsencrypt_root
-                                    ? ctx->cfg->letsencrypt_root
+            static const char acme[] = "/.well-known/acme-challenge/";
+            int close_after = 0;
+            if (!strncmp(req.path, acme, sizeof acme - 1)) {
+                const char *tok = req.path + sizeof acme - 1;
+                const char *le_root = cfg->letsencrypt_root
+                                    ? cfg->letsencrypt_root
                                     : "/var/www/letsencrypt";
-                snprintf(full, sizeof(full), "%s/%s", le_root, req.path + 28);
-                if (serve_file(&conn, le_root, full, head_only) < 0) {
-                    status = 404;
-                    http_send_simple(&conn, 404, "Not Found", NULL, "not found\n", 10, head_only);
-                } else {
+                char full[1024];
+                int fl = snprintf(full, sizeof(full), "%s/%s", le_root, tok);
+                int rc = -1;
+                if (*tok && fl > 0 && (size_t)fl < sizeof full)
+                    rc = serve_file(&conn, le_root, full, head_only,
+                                    cfg->def_body_timeout);
+                if (rc == 0) {
                     status = 200;
+                } else if (rc == -2) {
+                    status = 200;
+                    close_after = 1;
+                } else {
+                    status = 404;
+                    http_send_simple(&conn, 404, "Not Found", NULL,
+                                     "not found\n", 10, head_only);
                 }
             } else {
-                status = 301;
-                char loc[1024];
-                snprintf(loc, sizeof(loc), "Location: https://%s%s\r\n",
-                         req.host ? req.host : site->name, req.path);
-                http_send_simple(&conn, 301, "Moved Permanently", loc, "", 0, head_only);
+                char *loc = arena_sprintf(ctx->arena,
+                                          "Location: https://%s%s\r\n",
+                                          req.host, req.path);
+                if (!loc) {
+                    status = 500;
+                    send_error_close(&conn, status, head_only);
+                    close_after = 1;
+                } else {
+                    status = 301;
+                    http_send_simple(&conn, 301, "Moved Permanently", loc,
+                                     "", 0, head_only);
+                }
             }
             access_log_request(ctx, &peer, &req, NULL, status,
                                conn.nbytes - bytes0);
-            if (!req.keep_alive) break;
+            if (close_after || !req.keep_alive) break;
             continue;
         }
 
@@ -1189,9 +1694,22 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
             access_log_request(ctx, &peer, &req, NULL, status,
                                conn.nbytes - bytes0);
             if (!req.keep_alive) break;
-	    continue;
+            continue;
         }
-        if (!auth_check(eff, req.authorization)) {
+        if (eff->auth_required && authfail_blocked(ip_u32)) {
+            status = 429;
+            http_send_simple(&conn, 429, "Too Many Requests",
+                             "Retry-After: 60\r\n", "too many attempts\n", 18,
+                             head_only);
+            access_log_request(ctx, &peer, &req, NULL, status,
+                               conn.nbytes - bytes0);
+            if (!req.keep_alive) break;
+            continue;
+        }
+        int auth_ok = auth_check(eff, req.authorization);
+        if (eff->auth_required && req.authorization)
+            authfail_note(ip_u32, !auth_ok);
+        if (!auth_ok) {
             status = 401;
             http_send_simple(&conn, 401, "Unauthorized",
                 "WWW-Authenticate: Basic realm=\"corehttpd\"\r\n",
@@ -1199,7 +1717,7 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
             access_log_request(ctx, &peer, &req, NULL, status,
                                conn.nbytes - bytes0);
             if (!req.keep_alive) break;
-	    continue;
+            continue;
         }
         if (eff->auth_required) auth_user = eff->auth_user;
 
@@ -1207,91 +1725,40 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
         {
             const char *rest_n = rest;
             while (*rest_n == '/') rest_n++;
-
             const char *path_info = NULL;
-            CgiProgram *cp = cgi_lookup(eff, rest_n, &path_info);
-            if (cp) {
-                /* Where to exec from: absolute path, relative-to-dir path,
-                 * or the matched file under the effective dir. */
-                char prog_path[2048];
-                if (cp->path) {
-                    const char *pp = cp->path;
-                    size_t l = strlen(pp);
-                    if (pp[0] == '/') {
-                        if (l + 1 > sizeof(prog_path)) goto cgi_toolong;
-                        memcpy(prog_path, pp, l + 1);
-                    } else {
-                        size_t fl2 = strlen(fs_path);
-                        if (fl2 + 1 + l + 1 > sizeof(prog_path))
-                            goto cgi_toolong;
-                        memcpy(prog_path, fs_path, fl2);
-                        prog_path[fl2] = '/';
-                        memcpy(prog_path + fl2 + 1, pp, l + 1);
-                    }
-                } else {
-                    size_t plen = (size_t)(path_info - rest_n);
-                    size_t fl2 = strlen(fs_path);
-                    if (fl2 + 1 + plen + 1 > sizeof(prog_path))
-                        goto cgi_toolong;
-                    memcpy(prog_path, fs_path, fl2);
-                    prog_path[fl2] = '/';
-                    memcpy(prog_path + fl2 + 1, rest_n, plen);
-                    prog_path[fl2 + 1 + plen] = 0;
-                }
-
-                const char *user = cp->user ? cp->user : ctx->cfg->cgi_user;
-
-                /* SCRIPT_NAME = original URL path up to end of the CGI
-                 * name.  path_info points right after it in path_scratch. */
-                size_t sn_len = (size_t)(path_info - path_scratch);
-                char *script_name = arena_alloc(ctx->arena, sn_len + 1);
-                if (!script_name) goto cgi_nomem;
-                memcpy(script_name, path_scratch, sn_len);
-                script_name[sn_len] = 0;
-
-                char *req_uri = arena_sprintf(ctx->arena, "%s%s%s", req.path,
-                        req.query ? "?" : "", req.query ? req.query : "");
-                if (!req_uri) goto cgi_nomem;
-
-                char *env[24]; int ne = 0;
-                char *t;
-                env[ne++] = "GATEWAY_INTERFACE=CGI/1.1";
-                env[ne++] = "SERVER_PROTOCOL=HTTP/1.1";
-                if (!(t = arena_sprintf(ctx->arena, "REQUEST_METHOD=%s", req.method))) goto cgi_nomem;
-                env[ne++] = t;
-                if (!(t = arena_sprintf(ctx->arena, "REQUEST_URI=%s", req_uri))) goto cgi_nomem;
-                env[ne++] = t;
-                if (!(t = arena_sprintf(ctx->arena, "QUERY_STRING=%s", req.query ? req.query : ""))) goto cgi_nomem;
-                env[ne++] = t;
-                if (!(t = arena_sprintf(ctx->arena, "CONTENT_TYPE=%s", "application/octet-stream"))) goto cgi_nomem;
-                env[ne++] = t;
-                if (!(t = arena_sprintf(ctx->arena, "CONTENT_LENGTH=%zu", req.body_len))) goto cgi_nomem;
-                env[ne++] = t;
-                if (!(t = arena_sprintf(ctx->arena, "SCRIPT_NAME=%s", script_name))) goto cgi_nomem;
-                env[ne++] = t;
-                if (!(t = arena_sprintf(ctx->arena, "SCRIPT_FILENAME=%s", prog_path))) goto cgi_nomem;
-                env[ne++] = t;
-                if (!(t = arena_sprintf(ctx->arena, "DOCUMENT_ROOT=%s", fs_path))) goto cgi_nomem;
-                env[ne++] = t;
-                if (path_info && *path_info) {
-                    if (!(t = arena_sprintf(ctx->arena, "PATH_INFO=%s", path_info))) goto cgi_nomem;
-                    env[ne++] = t;
-                }
-                env[ne] = NULL;
-
-                if (cgi_dispatch(ctx->arena, ctx->cgi_fd, prog_path, user,
-                                 env, ne, req.body, req.body_len) < 0) {
+            if (cgi_lookup(eff, rest_n, &path_info)) {
+                int responded = 0;
+                if (req.body_len > CGI_MAX_BODY) {
+                    status = 413;
+                } else if (ctx->cgi_fd < 0) {
                     status = 502;
-                    log_warn("client %s: cgi dispatch failed for %s",
-                             ip, prog_path);
-                    http_send_simple(&conn, 502, "Bad Gateway", NULL, "cgi\n", 4, head_only);
+                } else if (cgi_send_request(ctx->cgi_fd, req.method,
+                                            site->name, req.path, req.query,
+                                            req.body, req.body_len) < 0) {
+                    log_err("cgi: cannot reach the CGI broker; CGI disabled");
+                    close(ctx->cgi_fd);
+                    ctx->cgi_fd = -1;
+                    status = 502;
                 } else {
-                    status = relay_cgi(&conn, ctx->cgi_fd, head_only);
+                    int chan_ok;
+                    status = relay_cgi(&conn, ctx->cgi_fd, head_only,
+                                       eff->cgi_timeout, cfg->def_body_timeout,
+                                       &responded, &chan_ok);
+                    if (!chan_ok) {
+                        log_err("cgi: broker channel broken; CGI disabled");
+                        close(ctx->cgi_fd);
+                        ctx->cgi_fd = -1;
+                    }
+                    if (!responded) {
+                        status = 502;
+                        log_warn("client %s: CGI %s produced no valid response",
+                                 ip, req.path);
+                    }
                 }
+                if (!responded) send_error_close(&conn, status, head_only);
                 access_log_request(ctx, &peer, &req, auth_user, status,
                                    conn.nbytes - bytes0);
-                if (!req.keep_alive) break;
-                continue;
+                break;      /* CGI output has no length: close the connection */
             }
         }
 
@@ -1300,11 +1767,10 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
         int fl = snprintf(full, sizeof(full), "%s/%s", fs_path, rest);
         if (fl < 0 || (size_t)fl >= sizeof(full)) {
             status = 414;
-            http_send_simple(&conn, 414, "URI Too Long", NULL, "uri too long\n", 13, head_only);
+            send_error_close(&conn, status, head_only);
             access_log_request(ctx, &peer, &req, auth_user, status,
                                conn.nbytes - bytes0);
-            if (!req.keep_alive) break;
-            continue;
+            break;
         }
         if (rest[0] == 0 || rest[strlen(rest) - 1] == '/') {
             /* directory: append "index.html" in place, bounded */
@@ -1312,60 +1778,32 @@ static void handle_connection(struct SrvCtx *ctx, int fd, int is_tls) {
             static const char suffix[] = "/index.html";   /* 11 + NUL */
             if (flen + sizeof(suffix) > sizeof(full)) {
                 status = 414;
-                http_send_simple(&conn, 414, "URI Too Long", NULL, "uri too long\n", 13, head_only);
+                send_error_close(&conn, status, head_only);
                 access_log_request(ctx, &peer, &req, auth_user, status,
                                    conn.nbytes - bytes0);
-                if (!req.keep_alive) break;
-                continue;
+                break;
             }
             memcpy(full + flen, suffix, sizeof(suffix));
-            if (serve_file(&conn, fs_path, full, head_only) < 0) {
-                /* a missing index.html is "not found"; an unreadable
-                 * file is "forbidden" (the httpd process reads files —
-                 * authentication does not grant filesystem access) */
-                int nf = (errno == ENOENT || errno == ENOTDIR);
-                status = nf ? 404 : 403;
-                log_debug("client %s: %s: %s", ip, full, strerror(errno));
-                http_send_simple(&conn, status,
-                                 nf ? "Not Found" : "Forbidden", NULL,
-                                 nf ? "not found\n" : "forbidden\n", 10,
-                                 head_only);
-            } else {
-                status = 200;
-            }
+        }
+        int rc = serve_file(&conn, fs_path, full, head_only,
+                            cfg->def_body_timeout);
+        if (rc == -1) {
+            /* a missing file is "not found"; an unreadable one is
+             * "forbidden" (the httpd process reads files — authentication
+             * does not grant filesystem access) */
+            int nf = (errno == ENOENT || errno == ENOTDIR);
+            status = nf ? 404 : 403;
+            log_debug("client %s: %s: %s", ip, full, strerror(errno));
+            http_send_simple(&conn, status,
+                             nf ? "Not Found" : "Forbidden", NULL,
+                             nf ? "not found\n" : "forbidden\n", 10,
+                             head_only);
         } else {
-            if (serve_file(&conn, fs_path, full, head_only) < 0) {
-                int nf = (errno == ENOENT || errno == ENOTDIR);
-                status = nf ? 404 : 403;
-                log_debug("client %s: %s: %s", ip, full, strerror(errno));
-                http_send_simple(&conn, status,
-                                 nf ? "Not Found" : "Forbidden", NULL,
-                                 nf ? "not found\n" : "forbidden\n", 10,
-                                 head_only);
-            } else {
-                status = 200;
-            }
+            status = 200;
         }
         access_log_request(ctx, &peer, &req, auth_user, status,
                            conn.nbytes - bytes0);
-        if (!req.keep_alive) break;
-        continue;
-
-cgi_nomem:
-        status = 500;
-        http_send_simple(&conn, 500, "Internal Server Error", NULL, "nomem\n", 6, head_only);
-        access_log_request(ctx, &peer, &req, auth_user, status,
-                           conn.nbytes - bytes0);
-        if (!req.keep_alive) break;
-        continue;
-
-cgi_toolong:
-        status = 502;
-        http_send_simple(&conn, 502, "Bad Gateway", NULL, "cgi\n", 4, head_only);
-        access_log_request(ctx, &peer, &req, auth_user, status,
-                           conn.nbytes - bytes0);
-        if (!req.keep_alive) break;
-        continue;
+        if (rc == -2 || !req.keep_alive) break;
     }
 
     if (conn.tls) tls_close(conn.tls);
@@ -1382,6 +1820,10 @@ static void run_httpd(struct SrvCtx *ctx) {
     g_ctx = ctx;
     signal(SIGTERM, on_term);
     signal(SIGINT,  on_term);
+
+    /* a stuck CGI broker must not block the httpd forever on a send */
+    struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
+    setsockopt(ctx->cgi_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 
     struct pollfd pfds[2] = {
         { .fd = ctx->srv80,  .events = POLLIN },
@@ -1403,7 +1845,7 @@ static void run_httpd(struct SrvCtx *ctx) {
 }
 
 /* =====================================================================
- * cgi process
+ * cgi process (broker, runs as root)
  * ===================================================================== */
 /* read exactly n bytes; the wire is a stream socketpair, so a single
  * read() may return a partial chunk */
@@ -1422,116 +1864,276 @@ static int read_all(int fd, void *buf, size_t n) {
     return 0;
 }
 
-static int cgi_run_one(int cgi_fd) {
-    struct CgiHdr h;
-    if (read_all(cgi_fd, &h, sizeof(h)) < 0) return -1;
+/* one response frame to the httpd; len 0 ends the response */
+static int cgi_frame(int fd, const void *data, uint32_t len) {
+    if (send_fd_all(fd, &len, 4) < 0) return -1;
+    if (len && send_fd_all(fd, data, len) < 0) return -1;
+    return 0;
+}
 
-    char prog[1024], user[256];
-    if (h.prog_len >= sizeof(prog) || h.user_len >= sizeof(user)) return -1;
-    if (read_all(cgi_fd, prog, h.prog_len) < 0) return -1;
-    prog[h.prog_len] = 0;
-    if (read_all(cgi_fd, user, h.user_len) < 0) return -1;
-    user[h.user_len] = 0;
+/* malloc'd "KEY=value"; exits on allocation failure */
+static char *env_str(const char *key, const char *val) {
+    size_t kl = strlen(key), vl = strlen(val);
+    char *e = malloc(kl + vl + 2);
+    if (!e) { log_err("cgi: out of memory"); exit(1); }
+    memcpy(e, key, kl);
+    e[kl] = '=';
+    memcpy(e + kl + 1, val, vl + 1);
+    return e;
+}
 
-    /* peer is a trusted socketpair, but stay defensive about wire values */
-    if (h.nenv > 128 || h.body_len > (16u << 20)) return -1;
+/* What the broker runs for a request, resolved from its own copy of the
+ * configuration.  The httpd only says which URL was requested, so even a
+ * compromised httpd can start nothing but the configured CGI programs,
+ * as their configured (non-root) users. */
+typedef struct {
+    char prog[2048];
+    char fs[2048];             /* the effective directory */
+    const char *user;
+    int timeout;
+    const char *path_info;     /* points into the path scratch copy */
+    size_t script_name_len;
+} CgiJob;
 
-    char **env = calloc((size_t)h.nenv + 1, sizeof(char *));
-    if (!env) return -1;
+static int cgi_resolve(Config *cfg, const char *host, char *path, CgiJob *j) {
+    if (!path_is_clean(path)) return -1;
+    SiteCfg *site = config_find_site(cfg, host);
+    if (!site) return -1;
+    char *rest;
+    DirCfg *eff = config_walk(site->root, path, &rest, j->fs, sizeof j->fs);
+    if (!eff || eff->deny) return -1;
+    const char *rest_n = rest;
+    while (*rest_n == '/') rest_n++;
+    const char *path_info = NULL;
+    CgiProgram *cp = cgi_lookup(eff, rest_n, &path_info);
+    if (!cp) return -1;
 
-    int ret = -1;
-    uint32_t ne = 0;
-    char *body = NULL;
-
-    for (; ne < h.nenv; ne++) {
-        uint32_t kl, vl;
-        if (read_all(cgi_fd, &kl, 4) < 0 || read_all(cgi_fd, &vl, 4) < 0)
-            goto fail;
-        if (kl > 4096 || vl > (1u << 20)) goto fail;
-        char *e = malloc((size_t)kl + vl + 2);
-        if (!e) goto fail;
-        if (read_all(cgi_fd, e, kl) < 0) { free(e); goto fail; }
-        e[kl] = '=';
-        if (vl && read_all(cgi_fd, e + kl + 1, vl) < 0) {
-            free(e); goto fail;
-        }
-        e[kl + 1 + vl] = 0;
-        env[ne] = e;
+    /* where to exec from: absolute path, relative-to-dir path, or the
+     * matched file under the effective dir */
+    size_t fl = strlen(j->fs);
+    if (cp->path && cp->path[0] == '/') {
+        size_t l = strlen(cp->path);
+        if (l + 1 > sizeof j->prog) return -1;
+        memcpy(j->prog, cp->path, l + 1);
+    } else {
+        const char *tail = cp->path ? cp->path : rest_n;
+        size_t l = cp->path ? strlen(cp->path) : (size_t)(path_info - rest_n);
+        if (fl + 1 + l + 1 > sizeof j->prog) return -1;
+        memcpy(j->prog, j->fs, fl);
+        j->prog[fl] = '/';
+        memcpy(j->prog + fl + 1, tail, l);
+        j->prog[fl + 1 + l] = 0;
     }
+    j->user = cp->user ? cp->user : cfg->cgi_user;
+    j->timeout = eff->cgi_timeout;
+    j->path_info = path_info;
+    j->script_name_len = (size_t)(path_info - path);
+    return 0;
+}
 
+static void kill_cgi(pid_t pid) {
+    if (pid <= 0) return;      /* never kill(-0) / kill(-1) */
+    kill(-pid, SIGKILL);       /* the program's process group */
+    kill(pid, SIGKILL);
+}
+
+/* Handle one request from the httpd.  Returns -1 only when the channel
+ * itself is unusable (EOF, protocol violation); a request that cannot
+ * be served gets an empty response, which the httpd answers with 502. */
+static int cgi_run_one(Config *cfg, int cgi_fd) {
+    /* collect programs that outlived an earlier request */
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+    struct CgiReq h;
+    if (read_all(cgi_fd, &h, sizeof(h)) < 0) return -1;
+    if (h.method_len < 1 || h.method_len > 16 || h.host_len > 255 ||
+        h.path_len < 1 || h.path_len > CGI_MAX_FIELD ||
+        h.query_len > CGI_MAX_FIELD || h.body_len > CGI_MAX_BODY)
+        return -1;
+
+    static char method[17], host[256], path[CGI_MAX_FIELD + 1],
+                scratch[CGI_MAX_FIELD + 1], query[CGI_MAX_FIELD + 1];
+    if (read_all(cgi_fd, method, h.method_len) < 0 ||
+        read_all(cgi_fd, host, h.host_len) < 0 ||
+        read_all(cgi_fd, path, h.path_len) < 0 ||
+        (h.query_len && read_all(cgi_fd, query, h.query_len) < 0))
+        return -1;
+    method[h.method_len] = 0;
+    host[h.host_len] = 0;
+    path[h.path_len] = 0;
+    query[h.query_len] = 0;
+    char *body = NULL;
     if (h.body_len) {
         body = malloc(h.body_len);
-        if (!body) goto fail;
-        if (read_all(cgi_fd, body, h.body_len) < 0) goto fail;
+        if (!body) { log_err("cgi: out of memory"); exit(1); }
+        if (read_all(cgi_fd, body, h.body_len) < 0) { free(body); return -1; }
     }
 
-    pid_t pid = fork();
-    if (pid < 0) goto fail;
-    if (pid == 0) {
-        struct passwd *pw = getpwnam(user);
-        if (!pw) {
-            log_err("cgi: unknown user '%s' for %s", user, prog);
-            _exit(126);
-        }
-        setgroups(0, NULL);
-        if (setgid(pw->pw_gid) < 0) {
-            log_err("cgi: setgid(%s) for %s: %s", user, prog, strerror(errno));
-            _exit(126);
-        }
-        if (setuid(pw->pw_uid) < 0) {
-            log_err("cgi: setuid(%s) for %s: %s", user, prog, strerror(errno));
-            _exit(126);
-        }
+    /* the request is fully read: the stream stays in sync from here on */
+    CgiJob j;
+    memcpy(scratch, path, h.path_len + 1);
+    int ok = strlen(method) == h.method_len && strlen(host) == h.host_len &&
+             strlen(path) == h.path_len && strlen(query) == h.query_len &&
+             cgi_resolve(cfg, h.host_len ? host : NULL, scratch, &j) == 0;
+    struct passwd *pw = ok ? getpwnam(j.user) : NULL;
+    if (ok && (!pw || pw->pw_uid == 0)) {
+        log_err("cgi: refusing to run %s as user '%s'", j.prog, j.user);
+        ok = 0;
+    }
+    if (!ok) {
+        free(body);
+        return cgi_frame(cgi_fd, NULL, 0);
+    }
+    uid_t uid = pw->pw_uid;
+    gid_t gid = pw->pw_gid;
 
-        int inp[2], outp[2];
-        if (pipe(inp) < 0 || pipe(outp) < 0) {
-            log_err("cgi: pipe for %s: %s", prog, strerror(errno));
+    /* environment (built here, not by the httpd) */
+    char script_name[CGI_MAX_FIELD + 1], clen[32];
+    memcpy(script_name, scratch, j.script_name_len);
+    script_name[j.script_name_len] = 0;
+    snprintf(clen, sizeof clen, "%u", h.body_len);
+    char *req_uri = malloc(h.path_len + 1 + h.query_len + 1);
+    if (!req_uri) { log_err("cgi: out of memory"); exit(1); }
+    snprintf(req_uri, h.path_len + 1 + h.query_len + 1, "%s%s%s",
+             path, h.query_len ? "?" : "", query);
+    char *env[16];
+    int ne = 0;
+    env[ne++] = env_str("GATEWAY_INTERFACE", "CGI/1.1");
+    env[ne++] = env_str("SERVER_PROTOCOL", "HTTP/1.1");
+    env[ne++] = env_str("REQUEST_METHOD", method);
+    env[ne++] = env_str("REQUEST_URI", req_uri);
+    env[ne++] = env_str("QUERY_STRING", query);
+    env[ne++] = env_str("CONTENT_TYPE", "application/octet-stream");
+    env[ne++] = env_str("CONTENT_LENGTH", clen);
+    env[ne++] = env_str("SCRIPT_NAME", script_name);
+    env[ne++] = env_str("SCRIPT_FILENAME", j.prog);
+    env[ne++] = env_str("DOCUMENT_ROOT", j.fs);
+    if (*j.path_info) env[ne++] = env_str("PATH_INFO", j.path_info);
+    env[ne] = NULL;
+    free(req_uri);
+
+    int ret = 0, ended = 0;
+    int inp[2] = { -1, -1 }, outp[2] = { -1, -1 };
+    if (pipe2(inp, O_CLOEXEC) < 0 || pipe2(outp, O_CLOEXEC) < 0) {
+        log_err("cgi: pipe for %s: %s", j.prog, strerror(errno));
+        goto done;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_err("cgi: fork for %s: %s", j.prog, strerror(errno));
+        goto done;
+    }
+    if (pid == 0) {
+        setpgid(0, 0);
+        if (setgroups(0, NULL) < 0 || setgid(gid) < 0 || setuid(uid) < 0 ||
+            getuid() != uid || geteuid() != uid || getgid() != gid) {
+            log_err("cgi: cannot switch to user '%s' for %s: %s",
+                    j.user, j.prog, strerror(errno));
             _exit(126);
         }
-        pid_t p2 = fork();
-        if (p2 == 0) {
-            dup2(inp[0], 0); dup2(outp[1], 1);
-            close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]);
-            /* the CGI program must not inherit the control channel back
-             * to the httpd (cgi_fd) or any other server fds: a rogue or
-             * compromised CGI could otherwise read the next request's
-             * parameters or forge responses.  Keep only the error log. */
-            for (int i = 3; i < 1024; i++)
-                if (i != g_errfd) close(i);
-            execve(prog, (char *const[]){ (char *)prog, NULL }, env);
-            log_err("cgi: execve %s: %s", prog, strerror(errno));
-            _exit(127);
-        }
-        close(inp[0]); close(outp[1]);
-        if (body) {
-            size_t w = 0;
-            while (w < h.body_len) {
-                ssize_t k = write(inp[1], body + w, h.body_len - w);
-                if (k <= 0) break;
-                w += (size_t)k;
+        dup2(inp[0], 0);
+        dup2(outp[1], 1);
+        /* the CGI program must not inherit the control channel back to
+         * the httpd (cgi_fd) or any other server fds.  Keep only the
+         * error log. */
+        for (int i = 3; i < 1024; i++)
+            if (i != g_errfd) close(i);
+        signal(SIGPIPE, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        execve(j.prog, (char *const[]){ j.prog, NULL }, env);
+        log_err("cgi: execve %s: %s", j.prog, strerror(errno));
+        _exit(127);
+    }
+    setpgid(pid, pid);
+    close(inp[0]); inp[0] = -1;
+    close(outp[1]); outp[1] = -1;
+    fcntl(inp[1], F_SETFL, O_NONBLOCK);
+    fcntl(outp[0], F_SETFL, O_NONBLOCK);
+
+    /* feed the body and collect the output at the same time (a program
+     * writing a lot before reading stdin must not deadlock), all within
+     * the CGI timeout */
+    int64_t deadline = mono_ms() + (int64_t)j.timeout * 1000;
+    size_t w = 0;
+    if (!h.body_len) { close(inp[1]); inp[1] = -1; }
+    static char buf[65536];
+    int timed_out = 0;
+    for (;;) {
+        int64_t rem = deadline - mono_ms();
+        if (rem <= 0) { timed_out = 1; break; }
+        struct pollfd p[2] = {
+            { outp[0], POLLIN, 0 },
+            { inp[1], POLLOUT, 0 },          /* ignored once closed (-1) */
+        };
+        int r = poll(p, 2, (int)rem);
+        if (r < 0) { if (errno == EINTR) continue; break; }
+        if (r == 0) continue;
+        if (inp[1] >= 0 && (p[1].revents & (POLLOUT | POLLERR | POLLHUP))) {
+            ssize_t k = write(inp[1], body + w, h.body_len - w);
+            if (k > 0) w += (size_t)k;
+            if ((k < 0 && errno != EAGAIN && errno != EINTR) || w == h.body_len) {
+                close(inp[1]);
+                inp[1] = -1;
             }
         }
-        close(inp[1]);
-        char buf[65536]; ssize_t r;
-        while ((r = read(outp[0], buf, sizeof(buf))) > 0)
-            send_fd_all(cgi_fd, buf, (size_t)r);
-        close(outp[0]);
-        waitpid(p2, NULL, 0);
-        _exit(0);
+        if (p[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+            ssize_t k = read(outp[0], buf, sizeof buf);
+            if (k > 0) {
+                if (cgi_frame(cgi_fd, buf, (uint32_t)k) < 0) { ret = -1; break; }
+            } else if (k == 0 || (errno != EAGAIN && errno != EINTR)) {
+                break;                       /* output closed */
+            }
+        }
     }
-    waitpid(pid, NULL, 0);
-    ret = 0;
+    if (timed_out) log_warn("cgi: %s timed out after %d s", j.prog, j.timeout);
+    if (timed_out || ret < 0) kill_cgi(pid);
+    /* the response is complete once stdout is closed: release the
+     * client before reaping the process */
+    if (ret == 0) {
+        ended = 1;
+        if (cgi_frame(cgi_fd, NULL, 0) < 0) ret = -1;
+    }
 
-fail:
-    for (uint32_t i = 0; i < ne; i++) free(env[i]);
-    free(env);
+    /* Reap.  A program still running at the deadline is killed, and
+     * the wait after a kill is bounded: a process that does not die
+     * (stuck in the kernel, or the kill was refused) must not stall the
+     * broker.  It is collected later by the sweep in cgi_run_one(). */
+    int killed = timed_out || ret < 0;
+    int64_t reap_deadline = killed ? mono_ms() + 1000 : deadline;
+    for (;;) {
+        int st;
+        pid_t wp = waitpid(pid, &st, WNOHANG);
+        if (wp == pid || (wp < 0 && errno != EINTR)) break;
+        int64_t now = mono_ms();
+        if (now >= reap_deadline) {
+            if (!killed) {
+                log_warn("cgi: %s still running after %d s, killed",
+                         j.prog, j.timeout);
+                kill_cgi(pid);
+                killed = 1;
+                reap_deadline = now + 1000;
+                continue;
+            }
+            log_err("cgi: %s (pid %d) does not exit after SIGKILL; not "
+                    "waiting for it", j.prog, (int)pid);
+            break;
+        }
+        poll(NULL, 0, 10);
+    }
+
+done:
+    if (inp[0] >= 0) close(inp[0]);
+    if (inp[1] >= 0) close(inp[1]);
+    if (outp[0] >= 0) close(outp[0]);
+    if (outp[1] >= 0) close(outp[1]);
+    for (int i = 0; i < ne; i++) free(env[i]);
     free(body);
+    if (ret == 0 && !ended && cgi_frame(cgi_fd, NULL, 0) < 0) ret = -1;
     return ret;
 }
 
-static void run_cgi(int cgi_fd) {
+static void run_cgi(Config *cfg, int cgi_fd) {
     signal(SIGTERM, SIG_DFL);
-    while (cgi_run_one(cgi_fd) == 0) {}
+    while (cgi_run_one(cfg, cgi_fd) == 0) {}
 }
 
 /* =====================================================================
@@ -1669,6 +2271,23 @@ static int owner_ids(const char *spec, uid_t *uid, gid_t *gid) {
     return 0;
 }
 
+/* Open a log file for appending as root without following symlinks.  It
+ * must be a regular file with a single link: otherwise someone who can
+ * write to the log directory could point the master's writes, chown and
+ * chmod at another file (e.g. a symlink or hard link to /etc/shadow). */
+static int open_log_file(const char *path, int mode) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_NOCTTY,
+                  mode);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1) {
+        close(fd);
+        errno = EPERM;
+        return -1;
+    }
+    return fd;
+}
+
 /* Load the separate error-log config file (jsonc):
  *   { "file": "...", "owner": "user[:group]", "mode": "0640",
  *     "level": "debug"|"info"|"warning"|"error" }
@@ -1719,9 +2338,11 @@ static void errorlog_init(Arena *a, const char *path, int explicit_flag) {
     const char *file = j_str(root, "file");
     if (file) {
         int mode = j_mode(root, "mode", 0640);
-        int fd = open(file, O_WRONLY | O_CREAT | O_APPEND, mode);
+        int fd = open_log_file(file, mode);
         if (fd < 0) {
-            fprintf(stderr, "corehttpd: error log %s: %s\n", file, strerror(errno));
+            fprintf(stderr, "corehttpd: error log %s: %s%s\n", file, strerror(errno),
+                    errno == EPERM || errno == ELOOP
+                        ? " (must be a regular file, not a link)" : "");
         } else {
             (void)fchmod(fd, (mode_t)mode);
             const char *owner = j_str(root, "owner");
@@ -1747,9 +2368,11 @@ static void errorlog_init(Arena *a, const char *path, int explicit_flag) {
 static int accesslog_open(const Config *cfg) {
     if (!cfg->access_log || !*cfg->access_log) return -1;
     int mode = cfg->access_log_mode >= 0 ? cfg->access_log_mode : 0640;
-    int fd = open(cfg->access_log, O_WRONLY | O_CREAT | O_APPEND, mode);
+    int fd = open_log_file(cfg->access_log, mode);
     if (fd < 0) {
-        log_err("access log %s: %s", cfg->access_log, strerror(errno));
+        log_err("access log %s: %s%s", cfg->access_log, strerror(errno),
+                errno == EPERM || errno == ELOOP
+                    ? " (must be a regular file, not a link)" : "");
         return -1;
     }
     if (cfg->access_log_mode >= 0) (void)fchmod(fd, (mode_t)mode);
@@ -1962,7 +2585,7 @@ int main(int argc, char **argv) {
         close(sigpipe[0]); close(sigpipe[1]);
         if (access_fd > 2) close(access_fd);
         /* cgi broker runs privileged so it can setuid per program */
-        run_cgi(cgi_pair[1]);
+        run_cgi(cfg, cgi_pair[1]);
         _exit(0);
     }
     close(cgi_pair[1]);
@@ -1976,6 +2599,7 @@ int main(int argc, char **argv) {
         if (access_fd > 2) close(access_fd);
         Arena *ar = mmap(NULL, sizeof(Arena), PROT_READ | PROT_WRITE,
                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (ar == MAP_FAILED) { log_err("mmap: %s", strerror(errno)); _exit(1); }
         arena_init(ar, cfg->arena_size);
         struct SrvCtx ctx = {
             .cfg = cfg, .arena = ar,

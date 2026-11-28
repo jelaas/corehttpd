@@ -191,7 +191,8 @@ The configuration file is **JSONC** — JSON with C-style comments
   "defaults": {
     "header_timeout": 10,     // reading the request line + headers
     "body_timeout": 30,       // reading the request body
-    "keepalive_timeout": 60   // reserved for the next request
+    "keepalive_timeout": 60,  // reserved for the next request
+    "cgi_timeout": 30         // a CGI program's total run time
   },
 
   // Virtual hosts, matched against the HTTP Host header (and, for TLS
@@ -213,9 +214,10 @@ The configuration file is **JSONC** — JSON with C-style comments
       "auth": { "user": "alice", "pass": "secret" },
 
       // IP allow-list (optional).  Entries are single addresses or
-      // networks: "192.168.1.7", "10.0.0.0/8".  An empty/absent list
-      // means everyone is allowed.  Subdirectories can only ever be
-      // stricter: their list is intersected with the parent's.
+      // networks: "192.168.1.7", "10.0.0.0/8".  Without ip_allow
+      // everyone is allowed; a malformed entry or an empty list is a
+      // config error.  Subdirectories can only ever be stricter: their
+      // list is intersected with the parent's.
       "ip_allow": ["127.0.0.1", "192.168.0.0/16"],
 
       // Per-directory timeouts (optional, inherited; may be longer or
@@ -270,10 +272,12 @@ The configuration file is **JSONC** — JSON with C-style comments
 ### Sites and directories
 
 Each site has a `name` (matched case-insensitively against the `Host`
-header, with an optional `:port` suffix ignored) and a `documentroot`.
+header, with an optional `:port` suffix ignored) and a `documentroot`,
+which is required: a site without one is a config error (there is no
+default, so a forgotten entry can never serve `/`).
 Directories are nested through the `subdirs` array; each entry has a
 `name` (the URL component) and an optional `documentroot` (default:
-parent path + `/<name>`).
+parent path + `/<name>`). Every `documentroot` must be an absolute path.
 
 A subdir `name` may be a **glob pattern** with `*` (any run of
 characters) and `?` (one character) — useful to cover many similarly
@@ -326,17 +330,39 @@ own certificate use the global one.
 Restrictions are inherited and can only become **stricter**:
 
 - **auth** — a child without its own `auth` block inherits the parent's.
-- **ip_allow** — a child's list is *intersected* with the parent's.
+- **ip_allow** — a child's list is *intersected* with the parent's: an
+  address must be allowed by both. Parent `127.0.0.0/8` and child
+  `127.0.0.5/32` give `127.0.0.5/32`; parent `0.0.0.0/0` and child
+  `10.0.0.0/8` give `10.0.0.0/8`. If the lists do not overlap at all,
+  nobody can access the child (a warning is logged at startup). Every
+  entry must be `a.b.c.d` or `a.b.c.d/n` with `n` from 0 to 32;
+  anything else, and an empty list, refuses to start.
+- **sites and subdirs** need a `name` (a single path component for
+  subdirs); a missing name is a config error.
 - **timeouts** — freely adjustable per directory (inherited).
 - **cgi** — a directory's CGI programs apply **only to that directory**;
   they are not inherited by subdirectories.
 
 ### Timeouts
 
-`header_timeout`, `body_timeout` and `keepalive_timeout` are seconds.
-They can be set in `defaults` and per directory (inherited through the
-hierarchy). The httpd process applies the global `header_timeout` and
-`body_timeout` when reading a request.
+`header_timeout`, `body_timeout`, `keepalive_timeout` and `cgi_timeout`
+are seconds. They can be set in `defaults` and per directory (inherited
+through the hierarchy). The httpd process applies the global values
+when reading a request:
+
+- `header_timeout` is the time for the **whole** TLS handshake and for
+  the whole request line + headers — not per read, so a client that
+  trickles bytes is cut off.
+- `body_timeout` plus 1 second per 32 KB is the time for the whole
+  request body; the same allowance applies to sending a static file. A
+  single write to a client that stops reading fails after
+  `body_timeout`.
+- `cgi_timeout` (per directory) limits a CGI program's run time; it is
+  then killed.
+
+Because a process handles one connection at a time, a connection that
+has sent nothing for 2 seconds is dropped as soon as another client is
+waiting (idle keep-alive connections are dropped immediately).
 
 ### CGI
 
@@ -355,10 +381,24 @@ The longest matching name wins, so `"gen.cgi/x/y"` runs `gen.cgi` with
 `PATH_INFO=/x/y`. The CGI receives the standard environment variables
 (`REQUEST_METHOD`, `REQUEST_URI`, `QUERY_STRING`, `CONTENT_TYPE`,
 `CONTENT_LENGTH`, `SCRIPT_NAME`, `SCRIPT_FILENAME`, `DOCUMENT_ROOT`,
-`PATH_INFO`, …), its stdin is the request body, and its stdout is
-forwarded to the client (headers such as `Status:` are honoured).
-The broker switches to the configured user (if it can; otherwise the
-program exits with status 126).
+`PATH_INFO`, …) and its stdin is the request body (at most 16 MB;
+larger bodies get `413`).
+
+Output: the program writes CGI headers (`Content-Type:`, `Status: 404
+Not Found`, `Location:` …), a blank line, then the body; corehttpd turns
+the headers into an HTTP/1.1 response. Output that starts with
+`HTTP/` is passed through unchanged (non-parsed headers). Output without
+a valid header block gets `502`. The response is not length-delimited,
+so the connection is closed after it.
+
+The broker runs as root so it can switch users. It does not trust the
+httpd: the httpd only passes on the requested URL, and the broker
+resolves the program and user from its own copy of the configuration,
+so it only ever starts configured programs. CGI users must exist and
+must not be root (checked at startup and again per request). The
+program runs in its own process group, is fed its input and drained of
+its output concurrently, and is killed (with its children) when it
+exceeds `cgi_timeout`.
 
 ## Logging
 
@@ -468,9 +508,15 @@ master at startup.
   pair is configured. HTTP requests are still routed by the `Host`
   header independently of which certificate was served.
 - The private key may be PEM (`BEGIN EC PRIVATE KEY` or
-  `BEGIN PRIVATE KEY`, i.e. SEC1 or PKCS#8) or raw DER. The curve is
-  validated; keys for other curves or algorithms are rejected at
-  startup.
+  `BEGIN PRIVATE KEY`, i.e. SEC1 or PKCS#8) or raw DER. The curve and
+  the key value are validated, and the key must belong to the first
+  (leaf) certificate in `cert_file`; otherwise startup is refused.
+- All cryptography touching secrets — ECDSA signing (nonce and key),
+  AES (bitsliced S-box, no lookup tables) and GHASH — runs in constant
+  time, so signing time does not leak the key. A client key share that
+  yields the all-zero X25519 secret is rejected, as are records that
+  break the TLS 1.3 record rules (size limits, plaintext after
+  ServerHello).
 - The master process loads and parses **every** certificate and key
   (the global pair plus each site's own pair) **once at startup** and
   shares them with the httpd child, so key files only need to be
@@ -649,8 +695,11 @@ the configuration:
 The directory URL is resolved in this order: the `--acme-url` option,
 then `--staging` (the Let's Encrypt staging directory), then the
 `acme_url` entry in the configuration, then the Let's Encrypt
-production directory. Everything else — HTTP-01 verification, the
-ECDSA P-256 keys, the CSR — is provider-independent. Note that the
+production directory. The directory URL — and every URL the ACME
+server hands back — must be `https://`; anything else is refused
+(only the local self-check of the challenge file uses plain HTTP).
+Everything else — HTTP-01 verification, the ECDSA P-256 keys, the CSR —
+is provider-independent. Note that the
 certificates must still be ECDSA P-256 for corehttpd.
 
 ## Request handling
@@ -666,6 +715,13 @@ certificates must still be ECDSA P-256 for corehttpd.
   static path serves the file).
 - Directory requests serve `<dir>/index.html`; there is no directory
   listing.
+- Requests are parsed strictly: exactly one `Host` header is required,
+  control characters and bare CR/LF are rejected (`400`), so is a
+  malformed or repeated `Content-Length`; `Transfer-Encoding` (chunked
+  bodies) gets `501`. The connection is closed after such errors.
+- After 10 failed Basic-auth attempts within 60 seconds, a client IP
+  gets `429 Too Many Requests` on protected paths for the rest of that
+  minute.
 - Connections support HTTP keep-alive; the server processes requests on
   a connection sequentially. While waiting for the next request on an
   idle keep-alive connection, the server watches the listening sockets
@@ -673,16 +729,24 @@ certificates must still be ECDSA P-256 for corehttpd.
   so a client that keeps a connection open (e.g. after the port-80
   redirect) never delays other clients.
 - Path traversal is rejected: `./`/`../` components and symlinks that
-  escape the document root are denied (`403`/`404`).
+  escape the document root are denied (`403`/`404`). The check is made
+  on the file actually opened, so swapping a symlink between check and
+  use does not help.
 
 ## Security notes
 
 - Memory for request handling comes from one arena per process; it is
-  reset between requests. If the arena is exhausted the request is
-  aborted. All other allocations are checked; a system allocation
-  failure terminates the process.
-- Passwords are compared in constant time to reduce timing side
-  channels.
+  reset — and zeroed — between requests, so credentials and bodies do
+  not linger. If the arena is exhausted the request is aborted. All
+  other allocations are checked; a system allocation failure terminates
+  the process. TLS keys and handshake secrets are wiped after use.
+- User names and passwords are compared in constant time (both are
+  always compared, and the time does not depend on the password
+  length).
+- Access-log fields are escaped (`\xHH` for control characters, `"`,
+  `\` and non-ASCII bytes), so requests cannot forge log lines.
+- Log files are opened by root without following symlinks and must be
+  regular files with a single link; otherwise they are not used.
 - The configuration file contains the Basic-auth passwords in clear
   text — protect it (`chmod 600`).
 - The httpd process runs unprivileged; the only privileged operations
@@ -696,8 +760,12 @@ certificates must still be ECDSA P-256 for corehttpd.
 ## Known limitations
 
 - IPv4 only.
-- One request at a time per process; scale by running more instances
-  (`SO_REUSEPORT` allows them to share ports 80/443).
+- One connection at a time per process; scale by running more
+  instances (`SO_REUSEPORT` allows them to share ports 80/443). Total
+  deadlines and idle-connection preemption (see "Timeouts") limit how
+  long one slow or silent client can hold a process, but a client that
+  keeps sending slowly can still occupy it for up to the timeouts, so
+  run several instances on exposed servers.
 - TLS 1.3 only; clients limited to TLS ≤ 1.2 cannot connect.
 - ECDSA P-256 certificates only.
 - No TLS session resumption, no HTTP/2.
